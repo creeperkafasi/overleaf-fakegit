@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""git-remote-overleaf — a read-only git remote backed by an Overleaf instance.
+
+Makes `git clone overleaf::<project>` / `git fetch` / `git pull` work like a
+normal remote: the helper checks the Overleaf change list, downloads only the
+NEW versions (zip per change, rate-limit-paced), builds commits in a local
+cache mirror (~/.cache/overleaf-fakegit/<slug>.git by default), and serves the
+refs. Progress is shown as "remote:" lines; if a fetch would download too many
+versions you are asked what to download.
+
+Config (resolved in this order):
+  git config overleaf.url          instance base URL
+  env OVERLEAF_URL
+  overleaf-fakegit/config.json     (tool folder)
+  https://overleaf.ktu.edu.tr      (fallback)
+  git config overleaf.cookie-file  cookie file path
+  env OVERLEAF_COOKIE
+  cookie.txt in the project dir / next to this script
+
+Cache location: git config overleaf.cache-dir | env OVERLEAF_CACHE_DIR |
+$XDG_CACHE_HOME/overleaf-fakegit | ~/.cache/overleaf-fakegit
+"""
+
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fakegit  # noqa: E402  (auto re-execs into the .venv if needed)
+
+PROMPT_THRESHOLD = 25   # more pending versions than this -> ask the user
+
+
+def _info(msg):
+    print(f"info {msg}", flush=True)
+
+
+def _tty_prompt(msg, default):
+    """Prompt on the controlling terminal (the helper's stdin/stdout are used
+    by the git protocol). Returns the default when there is no tty."""
+    try:
+        with open("/dev/tty", "r") as tty, open("/dev/tty", "w") as out:
+            out.write(f"{msg} [{default}]: ")
+            out.flush()
+            val = tty.readline().strip()
+        return val or default
+    except Exception:
+        return default
+
+
+def _git_config(key):
+    try:
+        import subprocess
+        out = subprocess.run(["git", "config", "--get", key],
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_cfg(spec):
+    """Instance URL, project id, cookie, and cache dir for the URL spec."""
+    tool_dir = os.path.dirname(os.path.abspath(__file__))
+    tool_cfg = {}
+    try:
+        import json
+        with open(os.path.join(tool_dir, "config.json")) as f:
+            tool_cfg = json.load(f)
+    except Exception:
+        pass
+
+    url = (_git_config("overleaf.url") or os.environ.get("OVERLEAF_URL")
+           or tool_cfg.get("url") or "https://overleaf.ktu.edu.tr")
+    cfg = {"url": url.rstrip("/"), "project": None, "cookie_file": "cookie.txt",
+           "interval": 300, "auto_stash": True}
+
+    # cookie
+    cfile = _git_config("overleaf.cookie-file")
+    cookie = fakegit.resolve_cookie(tool_dir, cfg, None, cfile)
+
+    # project id: 24-hex, else unique name match via discovery
+    project = spec.split("/")[-1] if spec else ""
+    if not fakegit.PROJECT_ID_RE.fullmatch(project):
+        project = fakegit._resolve_project(cfg, cookie, project, interactive=False)
+    cfg["project"] = project
+
+    # cache dir
+    cache = (_git_config("overleaf.cache-dir")
+             or os.environ.get("OVERLEAF_CACHE_DIR")
+             or os.environ.get("XDG_CACHE_HOME")
+             or os.path.expanduser("~/.cache"))
+    slug = project if fakegit.PROJECT_ID_RE.fullmatch(project) else \
+        re.sub(r"[^A-Za-z0-9]+", "-", spec).strip("-") or project
+    cache_dir = os.path.join(cache, "overleaf-fakegit", slug)
+    return cfg, cookie, cache_dir
+
+
+def _write_alternates(git_dir, mirror_objects):
+    """Point the requesting repo's object store at the cache mirror."""
+    try:
+        info_dir = os.path.join(git_dir, "objects", "info")
+        os.makedirs(info_dir, exist_ok=True)
+        alt_path = os.path.join(info_dir, "alternates")
+        existing = []
+        if os.path.exists(alt_path):
+            with open(alt_path) as f:
+                existing = f.read().splitlines()
+        if mirror_objects not in existing:
+            with open(alt_path, "a") as f:
+                if existing:
+                    f.write("\n")
+                f.write(mirror_objects + "\n")
+    except OSError as e:
+        _info(f"warning: could not set up object alternates: {e}")
+
+
+def _mirror_tip(mirror):
+    import pygit2
+    repo = pygit2.Repository(mirror)
+    if repo.head_is_unborn:
+        return None
+    return str(repo.head.target)
+
+
+def _sync(cfg, cookie, cache_dir):
+    """Check for new Overleaf changes and replay them into the cache mirror.
+    Never downloads the entire history on first use — asks (or defaults to a
+    bounded amount), and falls back to a snapshot of the latest version when
+    throttled."""
+    fakegit.create_mirror(cache_dir)
+    repo = fakegit.open_mirror(cache_dir)
+    tip = fakegit.mirror_tip_toV(repo)
+    updates = fakegit.fetch_all_updates(cfg, cookie, after_toV=tip,
+                                        max_updates=None)
+    if not updates:
+        return "no changes"
+    if len(updates) > PROMPT_THRESHOLD:
+        hours = len(updates) / 30.0
+        _info(f"{len(updates)} Overleaf versions pending "
+              f"(≈{hours:.1f}h at the 30/hour limit)")
+        choice = _tty_prompt(
+            "Download [a]ll / [l]ast 25 / [n]one (snapshot only)", "l")
+        if choice.lower().startswith("n"):
+            fakegit.snapshot_latest(cache_dir, cfg, cookie, None)
+            return "snapshot"
+        if choice.lower().startswith("l"):
+            updates = updates[-PROMPT_THRESHOLD:]
+            _info(f"downloading the last {PROMPT_THRESHOLD} versions…")
+    else:
+        _info(f"downloading {len(updates)} new version(s) from overleaf…")
+    try:
+        fakegit.replay_history(cache_dir, cfg, cookie, updates, None,
+                               trickle=True)
+    except fakegit.SyncError as e:
+        if "throttl" in str(e):
+            _info(str(e))
+            fakegit.snapshot_latest(cache_dir, cfg, cookie, None)
+            return "snapshot (rate-limited)"
+        raise
+    return "synced"
+
+
+def main():
+    # git invokes the helper as: git-remote-overleaf <remote-name> <url>
+    spec = sys.argv[2] if len(sys.argv) > 2 else (sys.argv[1] if len(sys.argv) > 1 else "")
+    git_dir = os.environ.get("GIT_DIR")
+    try:
+        cfg, cookie, cache_dir = _resolve_cfg(spec)
+    except fakegit.FgError as e:
+        _info(f"error: {e}")
+        return 1
+    os.makedirs(cache_dir, exist_ok=True)
+    mirror = fakegit.mirror_path(cache_dir)
+    if git_dir:
+        _write_alternates(git_dir, os.path.join(mirror, "objects"))
+    synced = False
+
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
+        cmd = line.strip()
+        if not cmd:
+            continue
+        if cmd == "capabilities":
+            print("fetch")
+            print("refspec refs/heads/*:refs/remotes/origin/*")
+            print()
+        elif cmd.startswith("option "):
+            print("ok")
+        elif cmd == "list":
+            if not synced:
+                try:
+                    _sync(cfg, cookie, cache_dir)
+                except fakegit.FgError as e:
+                    _info(f"sync failed: {e}")
+                synced = True
+            tip = _mirror_tip(mirror)
+            if tip:
+                print(f"{tip} refs/heads/main")
+                print(f"@{tip} HEAD")
+            print()
+        elif cmd.startswith("fetch "):
+            parts = cmd.split()
+            name = parts[2] if len(parts) > 2 else parts[1]
+            print(f"ok {name}")
+        elif cmd == "exit":
+            break
+        else:
+            print(f"error {cmd} unsupported command")
+        sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

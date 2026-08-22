@@ -88,6 +88,34 @@ python3 /home/denizt/dev/overleaf-fakegit/fakegit.py status
 Because the working repo is a real clone of the mirror, plain git works too:
 `git fetch origin && git merge origin/main` — same thing `sync` does.
 
+## Direct git remote: `overleaf::<project>`
+
+The bundled `git-remote-overleaf` helper makes an Overleaf project usable as a
+real git remote — no mirror setup needed on the client side:
+
+```sh
+export PATH="$PATH:/home/denizt/dev/overleaf-fakegit"   # so git finds the helper
+git clone overleaf::69b7e11ee0f8759721a6a6f0 my-paper    # by project id
+git clone "overleaf::Distance-Aware" my-paper            # or a unique name
+cd my-paper
+git pull    # checks the change list, downloads only NEW versions, merges
+```
+
+- **On-demand only**: a fetch checks the change list and downloads just the new
+  versions; it never pulls the entire history up front. The first fetch starts
+  with the latest state, and if many versions are pending you're asked what to
+  download — `[a]ll / [l]ast 25 / [n]one (snapshot only)` (defaults to `l`
+  when there's no terminal). Rate-limited downloads fall back to a snapshot of
+  the latest version, and the mirror resumes from where it stopped next time.
+- Progress shows as `remote:` lines ("downloading N new version(s) from
+  overleaf…").
+- A local cache mirror is kept at `~/.cache/overleaf-fakegit/<project>/`
+  (override with `git config overleaf.cache-dir` / `$OVERLEAF_CACHE_DIR`), so
+  re-fetches only download what changed.
+- Config: `git config overleaf.url`, `$OVERLEAF_URL`, or the tool folder's
+  `config.json`; cookie from `git config overleaf.cookie-file`,
+  `$OVERLEAF_COOKIE`, or `cookie.txt` next to the helper.
+
 ## Read-only server
 
 ```sh
