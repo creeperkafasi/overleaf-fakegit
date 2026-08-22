@@ -32,8 +32,13 @@ commit per sync from the latest zip (still through the mirror).
 
 ## Setup (one time per project folder)
 
-1. **Project id**: open the project in the browser — the URL is
-   `https://overleaf.ktu.edu.tr/project/<24-hex-id>`.
+1. **Find the project** — the tool can list your account's projects for you:
+   ```sh
+   python3 /home/denizt/dev/overleaf-fakegit/fakegit.py projects
+   # 69b7e11ee0f8759721a6a6f0  A Distance-Aware Hybrid Power and ...  (readWrite, updated 2026-08-16)
+   python3 /home/denizt/dev/overleaf-fakegit/fakegit.py projects --search 6TiSCH
+   python3 /home/denizt/dev/overleaf-fakegit/fakegit.py projects --json
+   ```
 
 2. **Session cookie** (a login token — treat it like a password):
    - DevTools → **Network** → reload → click any request to
@@ -44,19 +49,23 @@ commit per sync from the latest zip (still through the mirror).
      ```
    - The bare `overleaf.sid` value and the `OVERLEAF_COOKIE` env var also work.
 
-3. **Init** — creates the bare mirror, replays the full Overleaf history into
-   it (first run downloads one zip per change; ~10 min for 1000+ changes), then
-   clones it into your project folder:
+3. **Init** — `init` is interactive: it prompts for the instance URL (default
+   `https://overleaf.ktu.edu.tr`), lets you paste a cookie if none is saved,
+   and shows a numbered picker of your projects. Everything can also be passed
+   as flags for scripting — `--project` accepts either the 24-hex id or a name
+   substring:
    ```sh
-   cd ~/dev/papers/868-mhz-review        # your working folder
+   mkdir ~/dev/papers/distance-aware-6tisch-mac
+   cd ~/dev/papers/distance-aware-6tisch-mac
+   python3 /home/denizt/dev/overleaf-fakegit/fakegit.py init                  # interactive
    python3 /home/denizt/dev/overleaf-fakegit/fakegit.py init \
-     --url https://overleaf.ktu.edu.tr \
-     --project 6993449de0f8759721a4daa7
+     --url https://overleaf.ktu.edu.tr --project "Distance-Aware"            # by name
    ```
-   `--max-updates N` caps the replayed history for a quick start
-   (`--max-updates 0` = skip history, seed from the latest snapshot only).
-   The mirror lives at `.overleaf/mirror.git` (git-ignored); `config.json`
-   (url/project/cookie path) is written here and also git-ignored.
+   This creates the bare mirror, replays history (or seeds a snapshot), then
+   clones it into your project folder. `--max-updates N` caps the replayed
+   history for a quick start (`--max-updates 0` = snapshot only). The mirror
+   lives at `.overleaf/mirror.git` (git-ignored); `config.json` is written here
+   and also git-ignored.
 
 ## Daily use
 
