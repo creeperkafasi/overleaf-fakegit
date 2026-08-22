@@ -23,12 +23,28 @@ $XDG_CACHE_HOME/overleaf-fakegit | ~/.cache/overleaf-fakegit
 
 import os
 import re
+import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fakegit  # noqa: E402  (auto re-execs into the .venv if needed)
 
-PROMPT_THRESHOLD = 25   # more pending versions than this -> ask the user
+PROMPT_THRESHOLD = 10   # more pending versions than this -> ask the user
+
+DEBUG_LOG = os.environ.get("OVERLEAF_DEBUG_LOG")
+
+
+def _log(*args):
+    """Timestamped debug log to a file (stdout is the git protocol channel)."""
+    if not DEBUG_LOG:
+        return
+    try:
+        with open(DEBUG_LOG, "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] "
+                    + " ".join(str(a) for a in args) + "\n")
+    except Exception:
+        pass
 
 
 def _info(msg):
@@ -48,11 +64,18 @@ def _tty_prompt(msg, default):
         return default
 
 
+def _git_env():
+    """Env for git subprocess calls that target the cache mirror — the helper
+    inherits GIT_DIR from the invoking repo, which would override -C."""
+    return {k: v for k, v in os.environ.items()
+            if k not in ("GIT_DIR", "GIT_WORK_TREE")}
+
+
 def _git_config(key):
     try:
-        import subprocess
         out = subprocess.run(["git", "config", "--get", key],
-                             capture_output=True, text=True, timeout=5)
+                             capture_output=True, text=True, timeout=5,
+                             env=_git_env())
         if out.returncode == 0:
             return out.stdout.strip()
     except Exception:
@@ -125,65 +148,174 @@ def _mirror_tip(mirror):
 
 
 def _sync(cfg, cookie, cache_dir):
-    """Check for new Overleaf changes and replay them into the cache mirror.
-    Never downloads the entire history on first use — asks (or defaults to a
-    bounded amount), and falls back to a snapshot of the latest version when
-    throttled."""
+    """Get the latest Overleaf state into the cache mirror, fast.
+
+    Strategy: a snapshot of the latest version is one zip download (never
+    rate-limited), so that's the reliable base. Change-list commits are only
+    replayed when there are few pending versions. All output is captured and
+    relayed as protocol-safe `info` lines (stdout is the git protocol)."""
+    import contextlib
+    import io
     fakegit.create_mirror(cache_dir)
-    repo = fakegit.open_mirror(cache_dir)
-    tip = fakegit.mirror_tip_toV(repo)
-    updates = fakegit.fetch_all_updates(cfg, cookie, after_toV=tip,
-                                        max_updates=None)
-    if not updates:
-        return "no changes"
-    if len(updates) > PROMPT_THRESHOLD:
-        hours = len(updates) / 30.0
-        _info(f"{len(updates)} Overleaf versions pending "
-              f"(≈{hours:.1f}h at the 30/hour limit)")
-        choice = _tty_prompt(
-            "Download [a]ll / [l]ast 25 / [n]one (snapshot only)", "l")
-        if choice.lower().startswith("n"):
-            fakegit.snapshot_latest(cache_dir, cfg, cookie, None)
-            return "snapshot"
-        if choice.lower().startswith("l"):
-            updates = updates[-PROMPT_THRESHOLD:]
-            _info(f"downloading the last {PROMPT_THRESHOLD} versions…")
-    else:
-        _info(f"downloading {len(updates)} new version(s) from overleaf…")
+    buf = io.StringIO()
+    result = "no changes"
+    _log("sync start")
     try:
-        fakegit.replay_history(cache_dir, cfg, cookie, updates, None,
-                               trickle=True)
-    except fakegit.SyncError as e:
-        if "throttl" in str(e):
-            _info(str(e))
-            fakegit.snapshot_latest(cache_dir, cfg, cookie, None)
-            return "snapshot (rate-limited)"
-        raise
-    return "synced"
+        with contextlib.redirect_stdout(buf):
+            repo = fakegit.open_mirror(cache_dir)
+            state = fakegit.load_state(cache_dir)
+            tip = fakegit.mirror_tip_toV(repo)
+            # what we already have: the versioned tip, or the last version the
+            # snapshot was taken at (a snapshot tip itself has no version)
+            known = state.get("last_toV") or tip
+            _log("sync: tip=", tip, "known=", known)
+            snapshot_hash = None
+            new = []            # newest-first
+            try:
+                # single-page check: one cheap call, fail fast
+                page, _ = fakegit.fetch_updates(cfg, cookie, min_count=200)
+                new = [u for u in page if known is None or u["toV"] > known]
+                _log("sync: page=", len(page), "new=", len(new))
+            except fakegit.FgError as e:
+                _log("sync: updates API failed: ", e)
+                print(f"change list unavailable ({e}); serving a snapshot.")
+                _, snapshot_hash = fakegit.snapshot_latest(cache_dir, cfg,
+                                                           cookie, None)
+                result = "snapshot"
+            if not result.startswith("snapshot"):
+                if len(new) > PROMPT_THRESHOLD:
+                    _log("sync: too many updates, snapshotting")
+                    print(f"{len(new)} versions pending "
+                          f"(≈{len(new)/30.0:.1f}h at the 30/hour limit) — "
+                          f"fetching the latest snapshot only.")
+                    _, snapshot_hash = fakegit.snapshot_latest(cache_dir, cfg,
+                                                               cookie, None)
+                    result = "snapshot"
+                elif new:
+                    _log("sync: replaying", len(new), "updates")
+                    print(f"downloading {len(new)} new version(s) from "
+                          f"overleaf…")
+                    try:
+                        fakegit.replay_history(cache_dir, cfg, cookie,
+                                               list(reversed(new)),
+                                               None, trickle=True)
+                        result = "synced"
+                    except fakegit.SyncError as e:
+                        if "throttl" in str(e):
+                            _log("sync: throttled, snapshot fallback: ", e)
+                            print(str(e))
+                            _, snapshot_hash = fakegit.snapshot_latest(
+                                cache_dir, cfg, cookie, None)
+                            result = "snapshot (rate-limited)"
+                        else:
+                            _log("sync: replay error: ", e)
+                            raise
+            state = fakegit.load_state(cache_dir)
+            if snapshot_hash is not None:
+                state["last_content_hash"] = snapshot_hash
+            # remember the newest known version so the next fetch skips the
+            # zip download when nothing changed
+            if new:
+                newest = new[0]["toV"]     # new is newest-first
+                state["last_toV"] = max(state.get("last_toV") or 0, newest)
+            fakegit.save_state(cache_dir, state)
+            _log("sync done: result=", result,
+                 "last_toV=", state.get("last_toV"))
+    finally:
+        for line in buf.getvalue().splitlines():
+            if line.strip():
+                _info(line)
+    return result
+
+
+
+def _import_objects(git_dir, mirror):
+    """Write the cache mirror's objects into the requesting repo via
+    fast-import (private ref namespace). git 2.55's clone creates the real
+    refs itself (REF_TRANSACTION_FLAG_INITIAL), so we must not pre-create
+    refs/remotes/origin/*."""
+    _log("import objects into", git_dir)
+    p = subprocess.run(
+        ["git", "-C", mirror, "fast-export", "--signed-tags=strip",
+         "--refspec=refs/heads/main:refs/import/overleaf/main",
+         "refs/heads/main"],
+        capture_output=True, timeout=300, env=_git_env())
+    if p.returncode != 0:
+        raise RuntimeError(f"fast-export failed: "
+                           f"{p.stderr[:200].decode('utf-8', 'replace')}")
+    # drop the trailing 'reset'/'from' lines (commit lines already create refs)
+    lines = p.stdout.split(b"\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith(b"reset "):
+            i += 1
+            if i < len(lines) and lines[i].startswith(b"from "):
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    stream = b"\n".join(out) + b"done\n"
+    fi = subprocess.run(["git", "--git-dir=" + git_dir, "fast-import",
+                         "--quiet"],
+                        input=stream, capture_output=True, timeout=300,
+                        env=_git_env())
+    if fi.returncode != 0:
+        raise RuntimeError(f"fast-import failed: "
+                           f"{fi.stderr[:300].decode('utf-8', 'replace')}")
 
 
 def main():
     # git invokes the helper as: git-remote-overleaf <remote-name> <url>
     spec = sys.argv[2] if len(sys.argv) > 2 else (sys.argv[1] if len(sys.argv) > 1 else "")
     git_dir = os.environ.get("GIT_DIR")
+    _log("start", "argv=", sys.argv, "GIT_DIR=", git_dir)
     try:
         cfg, cookie, cache_dir = _resolve_cfg(spec)
     except fakegit.FgError as e:
         _info(f"error: {e}")
         return 1
+    _log("cfg: url=", cfg["url"], "project=", cfg["project"],
+         "cache_dir=", cache_dir, "cookie_len=", len(cookie))
     os.makedirs(cache_dir, exist_ok=True)
     mirror = fakegit.mirror_path(cache_dir)
     if git_dir:
         _write_alternates(git_dir, os.path.join(mirror, "objects"))
     synced = False
+    imported_objects = False
+    pending_fetches = []
 
     while True:
         line = sys.stdin.readline()
         if not line:
+            _log("stdin EOF")
             break
         cmd = line.strip()
         if not cmd:
+            # blank line ends a fetch batch: respond with oks + a blank line
+            if pending_fetches:
+                _log("fetch batch:", pending_fetches)
+                if git_dir and not imported_objects:
+                    try:
+                        _import_objects(git_dir, mirror)
+                        imported_objects = True
+                    except Exception as e:      # noqa: BLE001
+                        _log("import objects failed:", e)
+                        for fcmd in pending_fetches:
+                            print(f"error {fcmd.split()[1]} {e}")
+                        pending_fetches = []
+                        print()
+                        sys.stdout.flush()
+                        continue
+                for fcmd in pending_fetches:
+                    parts = fcmd.split()
+                    name = parts[2] if len(parts) > 2 else parts[1]
+                    _log("ok", name)
+                print()                         # end the response batch
+                sys.stdout.flush()
+                pending_fetches = []
             continue
+        _log("->", repr(cmd))
         if cmd == "capabilities":
             print("fetch")
             print("refspec refs/heads/*:refs/remotes/origin/*")
@@ -194,18 +326,17 @@ def main():
             if not synced:
                 try:
                     _sync(cfg, cookie, cache_dir)
-                except fakegit.FgError as e:
+                except Exception as e:      # noqa: BLE001 — keep the protocol alive
                     _info(f"sync failed: {e}")
                 synced = True
             tip = _mirror_tip(mirror)
+            _log("list tip=", tip)
             if tip:
                 print(f"{tip} refs/heads/main")
-                print(f"@{tip} HEAD")
+                print("@refs/heads/main HEAD")   # symbolic HEAD -> the branch
             print()
         elif cmd.startswith("fetch "):
-            parts = cmd.split()
-            name = parts[2] if len(parts) > 2 else parts[1]
-            print(f"ok {name}")
+            pending_fetches.append(cmd)
         elif cmd == "exit":
             break
         else:

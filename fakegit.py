@@ -128,6 +128,7 @@ DEFAULTS = {
     "cookie_file": DEFAULT_COOKIE_FILE,
     "interval": 300,
     "auto_stash": True,
+    "zip_delay": 0.3,          # seconds between version-zip downloads
 }
 
 def config_path(project_dir):
@@ -193,7 +194,7 @@ def resolve_cookie(project_dir, cfg, cli_cookie=None, cli_cookie_file=None):
 
 # --------------------------------------------------------------------------- http
 
-def http_get(cfg, cookie, path, timeout=180):
+def http_get(cfg, cookie, path, timeout=60, retries=3):
     base = (cfg["url"] or "").rstrip("/")
     pid = cfg.get("project")
     if not base:
@@ -206,18 +207,25 @@ def http_get(cfg, cookie, path, timeout=180):
     if pid:
         headers["Referer"] = f"{base}/project/{pid}"
     req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as e:
-        if e.code in (301, 302, 303, 307, 401, 403):
-            raise SyncError(
-                f"HTTP {e.code} — your cookie is probably expired or invalid. "
-                f"Copy a fresh one from the browser (F12 -> Network -> request "
-                f"headers -> Cookie) and update the cookie file, then retry.")
-        raise SyncError(f"HTTP {e.code} for {path}")
-    except urllib.error.URLError as e:
-        raise SyncError(f"network error: {e.reason}")
+    last_err = None
+    for attempt in range(max(1, retries)):   # retry transient network errors
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 401, 403):
+                raise SyncError(
+                    f"HTTP {e.code} — your cookie is probably expired or "
+                    f"invalid. Copy a fresh one from the browser (F12 -> "
+                    f"Network -> request headers -> Cookie) and update the "
+                    f"cookie file, then retry.")
+            raise SyncError(f"HTTP {e.code} for {path}")
+        except urllib.error.URLError as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(2)
+                continue
+    raise SyncError(f"network error: {last_err.reason if last_err else 'unknown'}")
 
 def _zip_or_die(data, what):
     if not data.startswith(ZIP_MAGIC):
@@ -240,7 +248,7 @@ def fetch_updates(cfg, cookie, min_count=500, before=None):
     path = f"/project/{cfg['project']}/updates?min_count={min_count}"
     if before:
         path += f"&before={before}"
-    data = http_get(cfg, cookie, path, timeout=60)
+    data = http_get(cfg, cookie, path, timeout=10, retries=2)
     try:
         obj = json.loads(data.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as e:
@@ -449,7 +457,7 @@ class _ReplayPacer:
         self.consecutive = 0
         self.trickle = trickle
 
-    def fetch(self, fetch_zip, version, attempts=4):
+    def fetch(self, fetch_zip, version, attempts=3):
         for i in range(attempts):
             try:
                 data = fetch_zip(version)
@@ -457,28 +465,23 @@ class _ReplayPacer:
                 if not _retryable(str(e)):
                     raise
                 self.consecutive += 1
-                if self.trickle:
-                    if self.consecutive >= 2:
-                        raise SyncError(
-                            "throttled: version-download budget exhausted "
-                            "(30/hour) — the mirror resumes from here on the "
-                            "next sync.")
-                    wait = 30.0
-                else:
-                    wait = min(30.0 * (2 ** (self.consecutive - 1)), 180.0)
+                # give up fast: the budget is per rolling hour, so waiting
+                # longer doesn't help within the same window
+                wait = 15.0 if self.trickle else 10.0
                 print(f"  rate-limited or transient error on v{version} ({e}) — "
-                      f"waiting {wait:.0f}s …")
+                      f"retrying in {wait:.0f}s …")
                 time.sleep(wait)
-                if self.consecutive >= 4 and not self.trickle:
+                if self.consecutive >= (2 if self.trickle else 2):
                     raise SyncError(
-                        f"the instance keeps throttling version downloads "
-                        f"({e}). This instance allows ~30 version-zip "
-                        f"downloads per user per rolling hour — run `sync` "
-                        f"again in about an hour; the mirror already contains "
-                        f"the commits made so far and resumes from there.")
+                        "throttled: version-download budget exhausted "
+                        "(30/hour) — the mirror resumes from here on the "
+                        "next sync." if self.trickle else
+                        "throttled: version-download budget exhausted "
+                        "(30/hour) — retry in about an hour; the mirror "
+                        "resumes from where it stopped.")
                 continue
             self.consecutive = 0
-            self.delay = max(0.5, self.delay / 2)   # recover slowly
+            self.delay = max(0.2, self.delay / 2)   # recover slowly
             return data
         raise SyncError(f"giving up on v{version} after {attempts} attempts")
 
@@ -947,8 +950,14 @@ def cmd_init(args):
         fetch_zip = lambda v: _version_zip_from_dir(args.updates_dir, v)
     else:
         try:
-            updates = fetch_all_updates(cfg, cookie, after_toV=None,
-                                        max_updates=args.max_updates)
+            if args.updates_dir:
+                updates = _updates_from_dir(args.updates_dir)
+            else:
+                # default: no history replay — snapshot only (fast, one zip).
+                # Pass --max-updates N for the last N changes.
+                max_updates = args.max_updates if args.max_updates is not None else 0
+                updates = fetch_all_updates(cfg, cookie, after_toV=None,
+                                            max_updates=max_updates)
         except SyncError as e:
             if _is_updates_error(e):
                 print(f"change list unavailable ({e}) — seeding the mirror with "
@@ -1318,7 +1327,8 @@ def main(argv=None):
     p_init.add_argument("--cookie", help="session cookie value")
     p_init.add_argument("--cookie-file", help="path to a file with the cookie")
     p_init.add_argument("--max-updates", type=int, default=None,
-                        help="cap the number of replayed history commits (quick init)")
+                        help="replay the last N history commits (default: none — "
+                             "snapshot only, fast)")
     p_init.add_argument("--updates-dir", help=argparse.SUPPRESS)
     p_init.add_argument("--from-zip", help=argparse.SUPPRESS)
 
