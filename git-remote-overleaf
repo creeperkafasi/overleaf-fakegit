@@ -33,6 +33,7 @@ import fakegit  # noqa: E402  (auto re-execs into the .venv if needed)
 PROMPT_THRESHOLD = 10   # more pending versions than this -> ask the user
 
 DEBUG_LOG = os.environ.get("OVERLEAF_DEBUG_LOG")
+CONNECTING = False   # stdout becomes the native git protocol during connect
 
 
 def _log(*args):
@@ -48,7 +49,10 @@ def _log(*args):
 
 
 def _info(msg):
-    print(f"info {msg}", flush=True)
+    if CONNECTING:
+        print(msg, file=sys.stderr, flush=True)   # stdout is the pack protocol
+    else:
+        print(f"info {msg}", flush=True)
 
 
 def _tty_prompt(msg, default):
@@ -317,11 +321,34 @@ def main():
             continue
         _log("->", repr(cmd))
         if cmd == "capabilities":
+            print("connect")
             print("fetch")
             print("refspec refs/heads/*:refs/remotes/origin/*")
             print()
         elif cmd.startswith("option "):
             print("ok")
+        elif cmd.startswith("connect"):
+            # native git protocol: sync the mirror, then run git upload-pack
+            # with the helper's stdin/stdout — real pack negotiation, only new
+            # objects transferred (vs re-serializing the whole history)
+            _log("connect:", cmd)
+            global CONNECTING
+            CONNECTING = True
+            if not synced:
+                try:
+                    _sync(cfg, cookie, cache_dir)
+                except Exception as e:      # noqa: BLE001
+                    _info(f"sync failed: {e}")
+                synced = True
+            print()                         # empty line = connection established
+            sys.stdout.flush()
+            p = subprocess.Popen(["git", "upload-pack", mirror],
+                                 stdin=sys.stdin.fileno(),
+                                 stdout=sys.stdout.fileno(),
+                                 stderr=sys.stderr, env=_git_env())
+            p.wait()
+            _log("connect ended")
+            return 0                        # helper exits after the connection
         elif cmd == "list":
             if not synced:
                 try:
