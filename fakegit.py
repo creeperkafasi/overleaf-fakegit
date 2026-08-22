@@ -1355,6 +1355,12 @@ def main(argv=None):
     except FgError as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
+    except BrokenPipeError:            # e.g. `fakegit.py status | head`
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        os._exit(141)
 
 if __name__ == "__main__":
     main()
