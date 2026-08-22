@@ -57,8 +57,11 @@ git pull
 - First clone takes ~5–20 s: it downloads the **latest snapshot** (one zip,
   never rate-limited) — not the whole history.
 - Each `git pull` makes one cheap change-list call; if nothing changed it's
-  "Already up to date" in ~2–5 s; if a few versions changed it downloads just
+  "Already up to date" in ~1–5 s; if a few versions changed it downloads just
   those and replays them as per-change commits.
+- Object transfer is a **native `git upload-pack`** (the `connect` capability):
+  real pack negotiation, so only the *new* objects move, delta-compressed —
+  not the whole project re-serialized.
 - Progress appears as `remote:` lines ("downloading 3 new version(s) from
   overleaf…"). If many versions are pending it says so and serves the latest
   snapshot instead (that's on purpose — see §7).
