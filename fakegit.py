@@ -440,12 +440,14 @@ def _retryable(msg):
     return ("429" in msg or "HTTP 50" in msg or msg.startswith("network error"))
 
 class _ReplayPacer:
-    """Adaptive pacing for version-zip downloads. The KTU instance throttles
-    the /version/<v>/zip endpoint with 429s; this backs off and aborts with a
-    resumable message if the limit stays hit."""
-    def __init__(self, cfg):
+    """Adaptive pacing for version-zip downloads. The instance throttles the
+    /version/<v>/zip endpoint (30/hour/user). In trickle mode (backfill) we
+    give up quickly per tick and let the next sync resume, so watch can slowly
+    grind through a large history within the hourly budget."""
+    def __init__(self, cfg, trickle=False):
         self.delay = float(cfg.get("zip_delay") or 1.0)
         self.consecutive = 0
+        self.trickle = trickle
 
     def fetch(self, fetch_zip, version, attempts=4):
         for i in range(attempts):
@@ -455,12 +457,19 @@ class _ReplayPacer:
                 if not _retryable(str(e)):
                     raise
                 self.consecutive += 1
-                wait = 30.0 * (2 ** (self.consecutive - 1))
-                wait = min(wait, 180.0)
+                if self.trickle:
+                    if self.consecutive >= 2:
+                        raise SyncError(
+                            "throttled: version-download budget exhausted "
+                            "(30/hour) — the mirror resumes from here on the "
+                            "next sync.")
+                    wait = 30.0
+                else:
+                    wait = min(30.0 * (2 ** (self.consecutive - 1)), 180.0)
                 print(f"  rate-limited or transient error on v{version} ({e}) — "
                       f"waiting {wait:.0f}s …")
                 time.sleep(wait)
-                if self.consecutive >= 4:
+                if self.consecutive >= 4 and not self.trickle:
                     raise SyncError(
                         f"the instance keeps throttling version downloads "
                         f"({e}). This instance allows ~30 version-zip "
@@ -473,7 +482,8 @@ class _ReplayPacer:
             return data
         raise SyncError(f"giving up on v{version} after {attempts} attempts")
 
-def replay_history(project_dir, cfg, cookie, updates, fetch_zip=None):
+def replay_history(project_dir, cfg, cookie, updates, fetch_zip=None,
+                   trickle=False):
     """Replay a list of updates (oldest->newest) into the mirror, downloading a
     version zip per update (serial + adaptive pacing, polite to the server).
     Each version is committed as soon as its zip arrives, so an interrupted run
@@ -485,7 +495,7 @@ def replay_history(project_dir, cfg, cookie, updates, fetch_zip=None):
     todo = [u for u in updates if tip_toV is None or u["toV"] > tip_toV]
     if not todo:
         return 0
-    pacer = _ReplayPacer(cfg)
+    pacer = _ReplayPacer(cfg, trickle=trickle)
     n = 0
     for u in todo:
         if n and pacer.delay:
@@ -1011,20 +1021,25 @@ def do_sync(project_dir, args, cfg):
     repo = open_mirror(project_dir)
     tip_before = mirror_tip_toV(repo)
     snapshot_hash = None
+    backfill = getattr(args, "backfill", False)
+    newest_toV = None
 
     if getattr(args, "updates_dir", None):
         updates = _updates_from_dir(args.updates_dir)
         fetch_zip = lambda v: _version_zip_from_dir(args.updates_dir, v)
-        replay_history(project_dir, cfg, cookie, updates, fetch_zip)
+        replay_history(project_dir, cfg, cookie, updates, fetch_zip,
+                       trickle=backfill)
+        newest_toV = updates[-1]["toV"] if updates else None
     else:
         try:
-            after = load_state(project_dir).get("last_toV")
+            after = None if backfill else load_state(project_dir).get("last_toV")
             updates = fetch_all_updates(cfg, cookie, after_toV=after,
                                         max_updates=None)
+            newest_toV = updates[-1]["toV"] if updates else None
             if getattr(args, "dry_run", False):
-                print(f"would replay {len(updates)} new change(s)")
+                print(f"would replay {len(updates)} change(s)")
                 return
-            replay_history(project_dir, cfg, cookie, updates)
+            replay_history(project_dir, cfg, cookie, updates, trickle=backfill)
         except SyncError as e:
             if "throttl" in str(e):
                 print(f"warning: {e}")
@@ -1035,8 +1050,25 @@ def do_sync(project_dir, args, cfg):
                 raise
     tip_after = mirror_tip_toV(repo)
     changed = tip_after is not None and tip_after != tip_before
+    if backfill:
+        # Backfill appends OLD history below the tip, so the mirror tip's tree
+        # is old until the replay catches up. Only merge into the working repo
+        # once the mirror reaches the newest version (trees identical -> clean).
+        if tip_after is not None and newest_toV is not None and tip_after >= newest_toV:
+            print("history backfill complete — merging into the working repo.")
+            changed = True
+        else:
+            if changed:
+                print(f"history backfill in progress ({tip_after}/{newest_toV}) — "
+                      f"mirror updated; working repo untouched until backfill "
+                      f"completes.")
+            else:
+                print(f"history backfill: at {tip_after}/{newest_toV}, "
+                      f"throttled or idle — will resume next sync.")
+            changed = False
     if not changed:
-        print("no changes on Overleaf since last sync.")
+        if not backfill:
+            print("no changes on Overleaf since last sync.")
         return
 
     # merge into the working repo
@@ -1308,6 +1340,9 @@ def main(argv=None):
                         help="report new changes without downloading/merging")
     p_sync.add_argument("--no-stash", action="store_true",
                         help="fail instead of auto-stashing local changes")
+    p_sync.add_argument("--backfill", action="store_true",
+                        help="also replay old Overleaf history into the mirror "
+                             "(rate-limit-paced; merges once caught up)")
     p_sync.add_argument("--cookie", help=argparse.SUPPRESS)
     p_sync.add_argument("--cookie-file", help=argparse.SUPPRESS)
     p_sync.add_argument("--from-zip", help=argparse.SUPPRESS)
@@ -1320,6 +1355,8 @@ def main(argv=None):
     p_watch.add_argument("--realtime", action="store_true",
                          help="listen on the realtime channel and sync as soon "
                               "as an edit happens (socket.io v1 xhr-polling)")
+    p_watch.add_argument("--backfill", action="store_true",
+                         help="also replay old Overleaf history (rate-limit-paced)")
     p_watch.add_argument("--force", action="store_true")
     p_watch.add_argument("--cookie", help=argparse.SUPPRESS)
     p_watch.add_argument("--cookie-file", help=argparse.SUPPRESS)
