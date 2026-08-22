@@ -1,0 +1,16 @@
+# secrets / local state
+cookie.txt
+config.json
+*.zip
+stage/
+
+# scratch / test dirs
+.probe/
+scratch/
+test-real/
+__pycache__/
+
+.venv/
+
+# reverse-engineering scratch (sharelatex/socket.io sources)
+research/
