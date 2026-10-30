@@ -180,6 +180,8 @@ def _sync(cfg, cookie, cache_dir):
                 page, _ = fakegit.fetch_updates(cfg, cookie, min_count=200)
                 new = [u for u in page if known is None or u["toV"] > known]
                 _log("sync: page=", len(page), "new=", len(new))
+            except fakegit.AuthError:
+                raise
             except fakegit.FgError as e:
                 _log("sync: updates API failed: ", e)
                 print(f"change list unavailable ({e}); serving a snapshot.")
@@ -337,6 +339,9 @@ def main():
             if not synced:
                 try:
                     _sync(cfg, cookie, cache_dir)
+                except fakegit.AuthError as e:
+                    _info(f"error: {e}")
+                    return 1
                 except Exception as e:      # noqa: BLE001
                     _info(f"sync failed: {e}")
                 synced = True
@@ -353,6 +358,9 @@ def main():
             if not synced:
                 try:
                     _sync(cfg, cookie, cache_dir)
+                except fakegit.AuthError as e:
+                    _info(f"error: {e}")
+                    return 1
                 except Exception as e:      # noqa: BLE001 — keep the protocol alive
                     _info(f"sync failed: {e}")
                 synced = True

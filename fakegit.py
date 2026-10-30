@@ -64,6 +64,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -107,6 +108,14 @@ class GitError(FgError):
 
 class SyncError(FgError):
     pass
+
+class AuthError(SyncError):
+    """Cookie expired/invalid — never worth retrying or falling back."""
+
+COOKIE_EXPIRED_MSG = (
+    "your cookie is expired or invalid (the server redirected to /login). "
+    "Copy a fresh one from the browser (F12 -> Network -> request headers -> "
+    "Cookie) into the cookie file, then retry.")
 
 # --------------------------------------------------------------------------- git CLI helper (working repo ops)
 
@@ -211,14 +220,14 @@ def http_get(cfg, cookie, path, timeout=60, retries=3):
     for attempt in range(max(1, retries)):   # retry transient network errors
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
+                # an expired session 302s to /login, which urllib follows
+                # silently — catch it here instead of failing on the HTML later
+                if urllib.parse.urlsplit(resp.geturl()).path.rstrip("/") == "/login":
+                    raise AuthError(COOKIE_EXPIRED_MSG)
                 return resp.read()
         except urllib.error.HTTPError as e:
-            if e.code in (301, 302, 303, 307, 401, 403):
-                raise SyncError(
-                    f"HTTP {e.code} — your cookie is probably expired or "
-                    f"invalid. Copy a fresh one from the browser (F12 -> "
-                    f"Network -> request headers -> Cookie) and update the "
-                    f"cookie file, then retry.")
+            if e.code in (401, 403):
+                raise AuthError(f"HTTP {e.code} — {COOKIE_EXPIRED_MSG}")
             raise SyncError(f"HTTP {e.code} for {path}")
         except urllib.error.URLError as e:
             last_err = e
@@ -465,13 +474,9 @@ class _ReplayPacer:
                 if not _retryable(str(e)):
                     raise
                 self.consecutive += 1
-                # give up fast: the budget is per rolling hour, so waiting
-                # longer doesn't help within the same window
-                wait = 15.0 if self.trickle else 10.0
-                print(f"  rate-limited or transient error on v{version} ({e}) — "
-                      f"retrying in {wait:.0f}s …")
-                time.sleep(wait)
-                if self.consecutive >= (2 if self.trickle else 2):
+                # give up fast: the budget is per rolling hour, so a 429 (or
+                # repeated errors) won't clear by waiting within this run
+                if "HTTP 429" in str(e) or self.consecutive >= 2:
                     raise SyncError(
                         "throttled: version-download budget exhausted "
                         "(30/hour) — the mirror resumes from here on the "
@@ -479,6 +484,10 @@ class _ReplayPacer:
                         "throttled: version-download budget exhausted "
                         "(30/hour) — retry in about an hour; the mirror "
                         "resumes from where it stopped.")
+                wait = 15.0 if self.trickle else 10.0
+                print(f"  transient error on v{version} ({e}) — "
+                      f"retrying in {wait:.0f}s …")
+                time.sleep(wait)
                 continue
             self.consecutive = 0
             self.delay = max(0.2, self.delay / 2)   # recover slowly
@@ -950,14 +959,11 @@ def cmd_init(args):
         fetch_zip = lambda v: _version_zip_from_dir(args.updates_dir, v)
     else:
         try:
-            if args.updates_dir:
-                updates = _updates_from_dir(args.updates_dir)
-            else:
-                # default: no history replay — snapshot only (fast, one zip).
-                # Pass --max-updates N for the last N changes.
-                max_updates = args.max_updates if args.max_updates is not None else 0
-                updates = fetch_all_updates(cfg, cookie, after_toV=None,
-                                            max_updates=max_updates)
+            # default: no history replay — snapshot only (fast, one zip).
+            # Pass --max-updates N for the last N changes.
+            max_updates = args.max_updates if args.max_updates is not None else 0
+            updates = fetch_all_updates(cfg, cookie, after_toV=None,
+                                        max_updates=max_updates)
         except SyncError as e:
             if _is_updates_error(e):
                 print(f"change list unavailable ({e}) — seeding the mirror with "

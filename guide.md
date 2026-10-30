@@ -172,7 +172,7 @@ Consequences, by design:
 
 | Symptom | Cause / fix |
 |---------|-------------|
-| `HTTP 302/401/403` or "not a zip file" | Cookie expired. Copy a fresh one into `cookie.txt`. |
+| `your cookie is expired or invalid (the server redirected to /login)` | Cookie expired. Copy a fresh one into `cookie.txt`. |
 | `throttled: version-download budget exhausted` | Used the 30/hour budget; retry in ~an hour, or let `watch`/`--backfill` resume automatically. |
 | `no changes on Overleaf since last sync` but you just edited | Overleaf may lag 1–2 min; run `sync --force` if you're sure. |
 | `git pull` says up to date but you want the latest state anyway | `git pull` triggers the check itself — if Overleaf genuinely has nothing new, it's up to date. |
