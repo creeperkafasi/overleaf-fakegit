@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import fakegit  # noqa: E402  (auto re-execs into the .venv if needed)
 
 DEBUG_LOG = os.environ.get("OVERLEAF_DEBUG_LOG")

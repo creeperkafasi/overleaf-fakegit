@@ -33,6 +33,18 @@ Overleaf's own zip, ~7 min for the whole history (4 parallel requests);
 incremental pulls take a second or two. The rate-limited
 `/version/<v>/zip` (30/hour) is only a last-resort fallback.
 
+## Install (once)
+
+```sh
+T=/home/denizt/dev/overleaf-fakegit
+ln -s $T/git-remote-overleaf ~/.local/bin/    # git finds overleaf:: remotes
+ln -s $T/fakegit.py ~/.local/bin/fakegit      # `fakegit projects`, `fakegit chat`, …
+ln -s $T/skills/overleaf-git ~/.claude/skills/ # agents: the overleaf-git skill
+```
+
+The scripts resolve symlinks, so the `.venv` and `cookie.txt` in the tool
+folder are found from anywhere.
+
 ## Setup (one time per project folder)
 
 1. **Find the project** — the tool can list your account's projects for you:

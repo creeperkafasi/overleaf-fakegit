@@ -75,7 +75,7 @@ import zipfile
 
 # --------------------------------------------------------------------------- pygit2 (with .venv auto re-exec)
 
-_VENV_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "bin", "python")
+_VENV_PY = os.path.join(os.path.dirname(os.path.realpath(__file__)), ".venv", "bin", "python")
 try:
     import pygit2
 except ImportError:
@@ -189,7 +189,7 @@ def resolve_cookie(project_dir, cfg, cli_cookie=None, cli_cookie_file=None):
             candidates.append(cli_cookie_file)
         cfile = cfg.get("cookie_file") or DEFAULT_COOKIE_FILE
         candidates.append(os.path.join(project_dir, cfile))
-        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+        candidates.append(os.path.join(os.path.dirname(os.path.realpath(__file__)),
                                        DEFAULT_COOKIE_FILE))
         for c in candidates:
             if os.path.exists(c):
@@ -1336,7 +1336,7 @@ def install_push_hook(project_dir):
     os.makedirs(os.path.dirname(hook), exist_ok=True)
     with open(hook, "w") as f:
         f.write("#!/bin/sh\n"
-                f"exec '{sys.executable}' '{os.path.abspath(__file__)}' "
+                f"exec '{sys.executable}' '{os.path.realpath(__file__)}' "
                 f"--dir '{os.path.abspath(project_dir)}' pre-receive\n")
     os.chmod(hook, 0o755)
     conf = pygit2.Repository(mirror).config    # not `git -C`: GIT_DIR may be set
@@ -1597,11 +1597,11 @@ def cmd_init(args):
           f"{working_branch(project_dir)})")
     print("next steps:\n"
           "  edit files and commit locally:  git add -A && git commit -m '...'\n"
-          f"  pull Overleaf changes:          python3 {os.path.abspath(__file__)} "
+          f"  pull Overleaf changes:          python3 {os.path.realpath(__file__)} "
           f"sync --dir {project_dir}\n"
-          f"  sync every 5 min:               python3 {os.path.abspath(__file__)} "
+          f"  sync every 5 min:               python3 {os.path.realpath(__file__)} "
           f"watch --dir {project_dir}\n"
-          f"  serve read-only:                python3 {os.path.abspath(__file__)} "
+          f"  serve read-only:                python3 {os.path.realpath(__file__)} "
           f"serve --dir {project_dir}")
 
 def do_sync(project_dir, args, cfg):
@@ -1861,8 +1861,10 @@ def cmd_projects(args):
     cfg = load_config(project_dir)
     if args.url:
         cfg["url"] = args.url
-    elif not cfg.get("url"):
-        cfg["url"] = _prompt("Overleaf instance URL", "https://overleaf.ktu.edu.tr")
+    elif not cfg.get("url"):            # outside a project: the tool's default
+        cfg["url"] = (os.environ.get("OVERLEAF_URL")
+                      or load_config(os.path.dirname(os.path.realpath(__file__))).get("url")
+                      or "https://overleaf.ktu.edu.tr")
     cookie = _ensure_cookie(project_dir, cfg, args.cookie, args.cookie_file)
     projects = fetch_projects(cfg, cookie)
     if args.search:
@@ -1881,7 +1883,7 @@ def cmd_projects(args):
 def remote_cfg(spec, git_config):
     """cfg + cookie for an `overleaf::<spec>` remote (spec: 24-hex id or a
     unique name). git_config(key) -> value or None."""
-    tool_dir = os.path.dirname(os.path.abspath(__file__))
+    tool_dir = os.path.dirname(os.path.realpath(__file__))
     tool_cfg = {}
     try:
         with open(os.path.join(tool_dir, CONFIG_NAME)) as f:

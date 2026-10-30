@@ -1,20 +1,26 @@
 ---
 name: overleaf-git
-description: Work on Overleaf projects (overleaf.ktu.edu.tr) through git — clone, read the full edit history (who changed what, when), read the project chat, proofread/edit locally and push back. Use when a folder has an `overleaf::` git remote or a fakegit `config.json`, or the user mentions an Overleaf project/paper.
+description: Work on the user's Overleaf projects (overleaf.ktu.edu.tr, no official git bridge) through git — list projects, clone, read the full edit history (who changed what, when), read the project chat, proofread/edit locally and push back. Use whenever the user mentions Overleaf or an Overleaf project/paper, or a folder has an `overleaf::` git remote or a fakegit `config.json`. Do NOT use git.overleaf.com or Overleaf git tokens.
 ---
 
 # Overleaf projects via git (overleaf-fakegit)
 
-Tool folder: `/home/denizt/dev/overleaf-fakegit` (must be on `PATH` for the
-`overleaf::` remote: `export PATH="$PATH:/home/denizt/dev/overleaf-fakegit"`).
-Auth is the session cookie in `/home/denizt/dev/overleaf-fakegit/cookie.txt` —
-never print or copy it. If a command says the cookie is expired, stop and ask
-the user for a fresh one.
+The user's Overleaf is the university instance `https://overleaf.ktu.edu.tr`.
+It has **no** official git bridge: `git.overleaf.com`, `https://…/git/…` URLs
+and Overleaf git tokens do not work. Use the `overleaf::` remote instead.
+
+Installed: `git-remote-overleaf` and `fakegit` are on `PATH` (symlinked in
+`~/.local/bin` from `/home/denizt/dev/overleaf-fakegit`). Auth is the session
+cookie in `/home/denizt/dev/overleaf-fakegit/cookie.txt`, already set up, so
+don't ask for tokens or passwords, and never print or copy the cookie. If a
+command says the cookie is expired, stop and ask the user to paste a fresh one
+into that file.
 
 ## Find and clone a project
 
 ```sh
-fakegit.py projects                         # id  name  (access, last update)
+fakegit projects                            # id  name  (access, last update)
+fakegit projects --search 6TiSCH
 git clone overleaf::<24-hex-id> paper       # or overleaf::"<unique name part>"
 ```
 
@@ -48,9 +54,9 @@ commit can contain several edits by the same session.
 Collaborators often leave review notes in the chat, not in the text:
 
 ```sh
-fakegit.py chat              # last 50 messages, oldest first
-fakegit.py chat --all        # everything
-fakegit.py chat --json       # machine-readable (id, content, timestamp, user{first_name,email})
+fakegit chat              # last 50 messages, oldest first
+fakegit chat --all        # everything
+fakegit chat --json       # machine-readable (id, content, timestamp, user{first_name,email})
 ```
 
 Run it inside the project folder (it finds the project from the `overleaf::`
