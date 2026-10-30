@@ -45,7 +45,45 @@ GET /project/{id}/updates?min_count=N[&before=<epoch_ms>]
 - `project_ops` are almost always empty; occasionally a file-add marker:
   `{"add": {"pathname": "x.pdf"}, "atV": 6103}` — no content, no text ops.
 - This is the authoritative, current history (the `/latest/history` one below
-  is stale).
+  is only the latest chunk — §2b).
+
+### 2b. History API — per-version content, NOT rate-limited
+The live instance runs Overleaf's modern history service (newer than
+`research/src-web`). Verified: replaying all 1230 updates of the 868 project
+through these gives a tip byte-identical to `/download/zip`.
+```
+GET /project/{id}/filetree/diff?from=V&to=V         files at V: {"diff":[{pathname, editable, operation?}]}
+GET /project/{id}/diff?pathname=P&from=A&to=B        text diff: {"diff":[{"u"|"i"|"d": str, meta?}]}
+GET /project/{id}/changes?since=N[&paginated=true]   raw change log, one entry per version
+GET /project/{id}/blob/{hash}                        file bytes by hash (= git blob SHA-1)
+GET /project/{id}/latest/history[?version=V]         the history chunk containing V
+```
+- `diff` with `from=to=V` returns one `{"u": <full text>}` segment = the file
+  at V; for binaries `{"diff": {"binary": true}}`. `meta.users` on `i`/`d`
+  segments says who typed what.
+- `filetree/diff` `operation`: added / removed (with `deletedAtV`) /
+  renamed / absent (= unchanged or edited).
+- `changes`: entry k turns version k into k+1. Operations: text edits
+  `{pathname, textOperation:[retain int | insert str | -delete int]}`; adds
+  `{pathname, file:{hash, stringLength|byteLength}}`; removes
+  `{pathname, newPathname:""}`; renames `{pathname, newPathname}`.
+  Non-paginated `since=0` returns everything (7287 entries here, ~3 MB);
+  `paginated=true` → `{changes:[≤2000], hasMore}`.
+- `latest/history` is the *latest chunk* (here `startVersion` 6000) — it
+  looked "stale" earlier only because older versions live in older chunks.
+- `/updates` `project_ops`: `{"add":{pathname}}`, `{"remove":{pathname}}`,
+  `{"rename":{pathname,newPathname}}`, each with `atV` (op at k → version k+1).
+- Labels: `GET /project/{id}/labels` → `[{id, comment, version, user_id,
+  created_at, user_display_name}]`; `POST` (CSRF) `{comment, version}`;
+  `DELETE /project/{id}/labels/{label_id}`.
+
+### 2c. Chat
+```
+GET  /project/{id}/messages?limit=N[&before=<ts ms>]   newest first
+POST /project/{id}/messages {content}                  (CSRF; not used)
+```
+Items: `{id, content, timestamp (ms), user_id, user{id, first_name, email}}`.
+Review comments / track changes (`/threads`, `/ranges`) → 404 here.
 
 ### 3. Versioned project zip — RATE-LIMITED (30/hour/user)
 ```
@@ -76,7 +114,7 @@ GET /project
 - Other useful metas on the same page: `ol-csrfToken`, `ol-ExposedSettings`
   (appName, adminEmail), `ol-userEmails`, `ol-user`, `ol-navbar`, `ol-i18n`.
 
-### 5. History JSON — stale + grouped + different version space
+### 5. History JSON (latest chunk) — early notes, superseded by §2b
 ```
 GET /project/{id}/latest/history
 ```
@@ -119,9 +157,30 @@ GET  /socket.io/1/xhr-polling/{sid}?projectId={id}&t=<epoch_ms>      # poll
 - `loadDocVersions` (old ShareLaTeX history-over-realtime) is **not handled**
   on this instance — per-version content is zips-only.
 
-### 7. Misc / dead ends
+### 7. Write API (used by `git push`) — CSRF-protected
+All need header `X-Csrf-Token: <token>` — the `ol-csrfToken` meta on the
+editor page `GET /project/{id}` (session-bound). Entity ids come from the
+realtime `joinProjectResponse` (`rootFolder[0]` = root; `folders`, `docs`,
+`fileRefs` each `{_id, name}`).
+```
+POST   /Project/{id}/upload?folder_id={folder}   multipart: `name` field + `qqfile` file part
+POST   /project/{id}/folder                      JSON {name, parent_folder_id} -> {_id, name, ...}
+DELETE /project/{id}/{doc|file|folder}/{entity_id}
+POST   /project/{id}/{type}/{entity_id}/rename   {name}          (not used yet)
+POST   /project/{id}/{type}/{entity_id}/move     {folder_id}     (not used yet)
+```
+- Upload is an **upsert**: same name in the same folder replaces content in
+  place (doc id + history kept); text → doc, binary → file. Response
+  `{"success":true,"entity_id":...,"entity_type":"doc"|"file"}`.
+- The live instance is newer than `research/src-web`: it reads the file name
+  from the `name` form field (without it: 422 `invalid_filename`).
+- Rate limits (source): upload 200 / 15 min / project; add-doc 30/min;
+  add-folder 60/min.
+
+### 8. Misc / dead ends
 - `GET /project/{id}/git` → 404 (no git bridge).
-- `GET /project/{id}/blob/{hash}` → 404 (no blob-by-hash endpoint).
+- `GET /project/{id}/version/{v}/{pathname}` → 404 (no per-file-at-version
+  route; use `/diff` or `/blob`).
 - `GET /project/{id}/doc/{doc_id}/version/{version_id}/restore` — exists in
   source (POST restore from a doc version); not exercised.
 - `GET /Project/{id}/file/{File_id}` — file download by internal file id
@@ -129,11 +188,11 @@ GET  /socket.io/1/xhr-polling/{sid}?projectId={id}&t=<epoch_ms>      # poll
 
 ## Gotchas
 
-- **Version spaces differ**: `/updates` uses `fromV/toV` (int, project-global);
-  `/latest/history` uses `projectVersion` (float) + per-doc `v` counters.
-- **The zip endpoint is the only per-version content source** on this instance
-  (no loadDocVersions, empty project_ops, stale history JSON) — and it's
-  throttled to 30/hour/user.
+- **Version spaces line up**: `/updates` `fromV/toV`, `/changes` indices and
+  history-chunk versions (`startVersion` + index) are the same numbering.
+  (`projectVersion` strings like "116.1" inside changes are something else.)
+- **Per-version content without the zip limit**: text via `/diff`, binaries
+  via `/changes` hashes + `/blob` (§2b). Only `/version/{v}/zip` is throttled.
 - Timestamps: `updates[].meta.end_ts` = epoch ms (UTC); the dashboard's
   `lastUpdated` = ISO.
 - The instance is a shared university account: `ol-prefetchedProjectsBlob`

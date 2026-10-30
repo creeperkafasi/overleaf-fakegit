@@ -1,34 +1,37 @@
 # overleaf-fakegit
 
-A **fake git remote** for zip-only Overleaf instances (like your university's
-old one — no git bridge; `/project/<id>/git` returns 404). It turns Overleaf's
-own **change list** into a real git history and serves it as a proper
-**read-only git server**, so your local workflow is ordinary git.
+A **git remote for Overleaf instances without a git bridge** (like the
+university's — `/project/<id>/git` returns 404). `git clone overleaf::<project>`
+gives you the project's **full edit history** as real git commits (one per
+Overleaf change, real author + timestamp), Overleaf labels as tags, and
+`git push` uploads your commits back. The project chat is one command away.
+Built so both you and coding agents can use plain git on Overleaf projects
+(see `skills/overleaf-git/SKILL.md`).
 
 ```
-Overleaf change list ──► bare mirror repo (.overleaf/mirror.git) ──► your working repo
-(updates API: one           one commit per change,                 (a real clone;
- commit per change,          real author + timestamp)               git merge origin/main)
- real author/timestamp)              │
-                                     └─► git daemon (read-only): git:// or file:// clones
+Overleaf history API ──► cache mirror (bare, pygit2) ──► your clone
+ (change list, per-version     one commit per change,      git pull / log / blame
+  text, blobs, labels)         labels -> overleaf/* tags     git push ──► pre-receive hook
+                                                                    ──► Overleaf write API
 ```
 
-## Why this design
+## How history works
 
-Probing the instance showed it exposes more than the plain zip:
+The instance runs Overleaf's modern history service, which exposes
+(none of these are rate-limited — see `apis.md`):
 
-- `GET /project/<id>/updates?min_count=N` — the full change list (this project:
-  1034 changes, v0 → v6352, each with the author's email and a timestamp)
-- `GET /project/<id>/version/<v>/zip` — the exact project state at any version
+- `GET /project/<id>/updates` — the change list (versions, authors, file ops)
+- `GET /project/<id>/diff?pathname=P&from=V&to=V` — a text file at version V
+- `GET /project/<id>/changes?since=N` — the raw change log; file adds carry
+  blob hashes, `GET /project/<id>/blob/<hash>` serves the bytes (git SHA-1)
+- `GET /project/<id>/labels` — named versions
 
-So instead of one snapshot per sync, `init` **replays the whole change list** as
-one git commit per Overleaf change — `git log` reads like real history
-(`457519 <457519@ogr.ktu.edu.tr> 2026-08-22 10:44:45 Overleaf change v6351→v6352`).
-Repos are built with **libgit2 (pygit2)** — no shelling out for object
-creation — and served read-only via `git daemon`.
-
-If an instance lacks the updates API, the tool falls back to one snapshot
-commit per sync from the latest zip (still through the mirror).
+Each Overleaf change becomes a commit built from its parent tree + that
+change's add/remove/rename ops + the new content of the files it touched.
+Verified on a 1230-change project: the replayed tip is byte-identical to
+Overleaf's own zip, ~7 min for the whole history (4 parallel requests);
+incremental pulls take a second or two. The rate-limited
+`/version/<v>/zip` (30/hour) is only a last-resort fallback.
 
 ## Setup (one time per project folder)
 
@@ -61,9 +64,9 @@ commit per sync from the latest zip (still through the mirror).
    python3 /home/denizt/dev/overleaf-fakegit/fakegit.py init \
      --url https://overleaf.ktu.edu.tr --project "Distance-Aware"            # by name
    ```
-   This creates the bare mirror, replays history (or seeds a snapshot), then
+   This creates the bare mirror, replays the full history, then
    clones it into your project folder. `--max-updates N` caps the replayed
-   history for a quick start (`--max-updates 0` = snapshot only). The mirror
+   history (`--max-updates 0` = snapshot only). The mirror
    lives at `.overleaf/mirror.git` (git-ignored); `config.json` is written here
    and also git-ignored.
 
@@ -101,20 +104,58 @@ cd my-paper
 git pull    # checks the change list, downloads only NEW versions, merges
 ```
 
-- **On-demand only**: a fetch checks the change list and downloads just the new
-  versions; it never pulls the entire history up front. The first fetch starts
-  with the latest state, and if many versions are pending you're asked what to
-  download — `[a]ll / [l]ast 25 / [n]one (snapshot only)` (defaults to `l`
-  when there's no terminal). Rate-limited downloads fall back to a snapshot of
-  the latest version, and the mirror resumes from where it stopped next time.
-- Progress shows as `remote:` lines ("downloading N new version(s) from
-  overleaf…").
+- **Full history**: the first fetch replays every Overleaf change as a
+  commit; later fetches replay only the new ones. Labels arrive as annotated
+  `overleaf/<label>` tags.
+- Progress shows as `remote:` lines ("replaying N Overleaf version(s) as
+  commits…").
 - A local cache mirror is kept at `~/.cache/overleaf-fakegit/<project>/`
   (override with `git config overleaf.cache-dir` / `$OVERLEAF_CACHE_DIR`), so
   re-fetches only download what changed.
+
+## Chat
+
+```sh
+fakegit.py chat            # last 50 messages, oldest first
+fakegit.py chat --all      # whole chat;  --json for machine-readable output
+```
+
+Works in any project folder (`overleaf::` clone or `init` folder). Review
+comments / track changes aren't exposed by this instance (404).
 - Config: `git config overleaf.url`, `$OVERLEAF_URL`, or the tool folder's
   `config.json`; cookie from `git config overleaf.cookie-file`,
   `$OVERLEAF_COOKIE`, or `cookie.txt` next to the helper.
+
+## Pushing to Overleaf
+
+`git push` works with both the `overleaf::<project>` remote and the
+`init` mirror (`git push origin main`):
+
+```sh
+vim main.tex && git commit -am "rewrite intro"
+git push
+# remote: overleaf: uploading 1 file(s), deleting 0…
+# remote:   updated main.tex
+# remote: overleaf: push applied.
+```
+
+The push lands in the mirror via a real `git receive-pack`; its `pre-receive`
+hook (`fakegit.py pre-receive`) diffs the Overleaf state against your pushed
+tree and, before the ref moves:
+
+- uploads added/changed files (upsert in place — existing docs keep their id
+  and Overleaf history; text becomes docs, binaries become files),
+- creates missing folders, deletes removed files and folders left empty,
+- turns renames/moves (`git mv`, detected like `git diff -M`) into Overleaf
+  rename/move — the file keeps its Overleaf history,
+- `git push origin <tag>` (an annotated tag on the current `main` tip)
+  creates an Overleaf label named after the tag message.
+
+Only the final tree is uploaded (Overleaf has no commits). Safety rails:
+fast-forward only (no force-push), `main` only, and the hook re-checks the
+change list right before uploading — if a collaborator edited in the meantime
+the push is declined with "Pull first". Symlinks/submodules are refused. If an
+upload fails midway the ref doesn't move; `git pull`, then push again.
 
 ## Read-only server
 
@@ -138,7 +179,8 @@ serving (read-only):
 - Bind a specific interface: `serve --listen 127.0.0.1` (default: all).
 - Other machines on your LAN: `git clone git://<printed-lan-ip>:9418/mirror.git`
 - No server at all: `git clone file:///path/to/project/.overleaf/mirror.git`
-- It is strictly read-only: pushes are denied by `git daemon`.
+- It is strictly read-only: pushes are denied by `git daemon` (push from
+  the project folder itself instead).
 
 ## How merging behaves
 
@@ -177,24 +219,16 @@ systemctl --user daemon-reload && systemctl --user enable --now overleaf-sync.ti
 
 ## Notes & limitations
 
-- **One-way**: Overleaf → local only. Push back via the web editor (or the
-  two-way `overleaf-sync` CLI at `/home/denizt/dev/overleaf-sync`).
+- **Push** (`git push`, both workflows) is main-only and fast-forward-only:
+  if Overleaf changed since your last pull the push is rejected — `git pull`,
+  then push again. See "Pushing to Overleaf" below.
 - **Cookie expiry**: a stale cookie gives a clear error — re-copy from DevTools.
-- **Change trigger**: `sync`/`watch` check the cheap updates API first and only
-  download zips when the version moved. If the API is unavailable on an
-  instance, it falls back to full-zip snapshots.
-- **Rate limiting (KTU instance)**: reverse-engineered from the ShareLaTeX web
-  source (`research/src-web/app/src/router.js`): the `/version/<v>/zip` endpoint
-  is limited to **30 downloads per user per rolling hour**
-  (`RateLimiterMiddleware.rateLimit({endpointName: 'download-project-revision',
-  maxRequests: 30, timeInterval: 60*60})`). The tool downloads version zips
-  serially, commits each version as it arrives, and resumes from the mirror tip,
-  so a throttled run never re-downloads finished versions. Practical path:
-  - `init` seeds from the latest snapshot (not throttled) and records the
-    current version, so **daily syncs only pull new changes** — the mirror
-    accumulates real per-change history from now on;
-  - to backfill older history, re-run `init --max-updates N` (~30 per hour
-    budget; an interrupted run resumes from the mirror tip), then `sync`.
+- **Change trigger**: `sync`/`watch`/`git pull` check the cheap change list
+  first and only fetch content when the version moved. If the history API is
+  unavailable on an instance, it falls back to version zips / snapshots.
+- **Rate limiting**: only `/version/<v>/zip` is throttled (30/hour/user,
+  `download-project-revision` in the source). History replay doesn't use it
+  (except as a last resort for a binary whose hash can't be resolved).
 
 ## Realtime updates (`watch --realtime`)
 
@@ -226,18 +260,10 @@ git daemon --reuseaddr --base-path=/srv/overleaf-mirrors --export-all --port=941
 # /srv/overleaf-mirrors/<friend>.git  ->  git clone git://<host>:9418/<friend>.git
 ```
 
-Each friend's backfill counts against their own Overleaf account's rate limit
-(30 version-zips/hour) — with `--max-updates` pacing that's fine.
 - **Empty folders** aren't tracked by git (same as normal git).
-- **Per-version content is zips-only on this instance**: the realtime channel
-  serves the current project state and edit events but has no `loadDocVersions`
-  (this instance uses the newer v1-history architecture), `/updates` carries no
-  text ops, and `/latest/history` is stale (its ops are non-invertible anyway —
-  they contain deletes). So history replay needs the rate-limited version zips;
-  the realtime channel is used for **edit notifications** (`watch --realtime`).
 - **Timestamps/authors** come from the Overleaf change list (`end_ts`,
-  `meta.users[0]`); auto-saves produce one commit each, like Overleaf's own
-  History tab.
+  `meta.users[0]`, further users as `Co-authored-by:`); changes are grouped
+  like Overleaf's own History tab.
 
 ## Layout
 
@@ -246,7 +272,9 @@ fakegit.py          the tool (needs pygit2; auto-runs from .venv if present)
 cookie.txt          your session cookie (git-ignored)
 config.json         default config (git-ignored)
 .venv/              pygit2/libgit2 (created by setup, git-ignored)
-README.md
+README.md, guide.md overview / how-to
+apis.md             reverse-engineered Overleaf endpoints
+skills/overleaf-git/SKILL.md   instructions for coding agents
 
 Per project folder:
   .git/             your working repo

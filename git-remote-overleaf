@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""git-remote-overleaf — a read-only git remote backed by an Overleaf instance.
+"""git-remote-overleaf — a git remote (pull + push) backed by an Overleaf instance.
 
-Makes `git clone overleaf::<project>` / `git fetch` / `git pull` work like a
-normal remote: the helper checks the Overleaf change list, downloads only the
-NEW versions (zip per change, rate-limit-paced), builds commits in a local
-cache mirror (~/.cache/overleaf-fakegit/<slug>.git by default), and serves the
-refs. Progress is shown as "remote:" lines; if a fetch would download too many
-versions you are asked what to download.
+Makes `git clone overleaf::<project>` / `git fetch` / `git pull` / `git push`
+work like a normal remote: the helper checks the Overleaf change list, downloads only the
+NEW versions (history API, not rate-limited; the first fetch replays the
+whole history), builds one commit per Overleaf change in a local cache mirror
+(~/.cache/overleaf-fakegit/<project-id>/ by default), turns labels into
+overleaf/* tags, and serves it all through native git upload-pack. Progress is
+shown as "remote:" lines.
+
+`git push` (main only, fast-forward only) runs git receive-pack on the cache
+mirror; its pre-receive hook (fakegit.py pre-receive) uploads the changed
+files to Overleaf and deletes removed ones before the ref moves.
 
 Config (resolved in this order):
   git config overleaf.url          instance base URL
@@ -22,15 +27,12 @@ $XDG_CACHE_HOME/overleaf-fakegit | ~/.cache/overleaf-fakegit
 """
 
 import os
-import re
 import subprocess
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fakegit  # noqa: E402  (auto re-execs into the .venv if needed)
-
-PROMPT_THRESHOLD = 10   # more pending versions than this -> ask the user
 
 DEBUG_LOG = os.environ.get("OVERLEAF_DEBUG_LOG")
 CONNECTING = False   # stdout becomes the native git protocol during connect
@@ -55,19 +57,6 @@ def _info(msg):
         print(f"info {msg}", flush=True)
 
 
-def _tty_prompt(msg, default):
-    """Prompt on the controlling terminal (the helper's stdin/stdout are used
-    by the git protocol). Returns the default when there is no tty."""
-    try:
-        with open("/dev/tty", "r") as tty, open("/dev/tty", "w") as out:
-            out.write(f"{msg} [{default}]: ")
-            out.flush()
-            val = tty.readline().strip()
-        return val or default
-    except Exception:
-        return default
-
-
 def _git_env():
     """Env for git subprocess calls that target the cache mirror — the helper
     inherits GIT_DIR from the invoking repo, which would override -C."""
@@ -89,39 +78,13 @@ def _git_config(key):
 
 def _resolve_cfg(spec):
     """Instance URL, project id, cookie, and cache dir for the URL spec."""
-    tool_dir = os.path.dirname(os.path.abspath(__file__))
-    tool_cfg = {}
-    try:
-        import json
-        with open(os.path.join(tool_dir, "config.json")) as f:
-            tool_cfg = json.load(f)
-    except Exception:
-        pass
-
-    url = (_git_config("overleaf.url") or os.environ.get("OVERLEAF_URL")
-           or tool_cfg.get("url") or "https://overleaf.ktu.edu.tr")
-    cfg = {"url": url.rstrip("/"), "project": None, "cookie_file": "cookie.txt",
-           "interval": 300, "auto_stash": True}
-
-    # cookie
-    cfile = _git_config("overleaf.cookie-file")
-    cookie = fakegit.resolve_cookie(tool_dir, cfg, None, cfile)
-
-    # project id: 24-hex, else unique name match via discovery
-    project = spec.split("/")[-1] if spec else ""
-    if not fakegit.PROJECT_ID_RE.fullmatch(project):
-        project = fakegit._resolve_project(cfg, cookie, project, interactive=False)
-    cfg["project"] = project
-
-    # cache dir
+    cfg, cookie = fakegit.remote_cfg(spec, _git_config)
+    project = cfg["project"]
     cache = (_git_config("overleaf.cache-dir")
              or os.environ.get("OVERLEAF_CACHE_DIR")
              or os.environ.get("XDG_CACHE_HOME")
              or os.path.expanduser("~/.cache"))
-    slug = project if fakegit.PROJECT_ID_RE.fullmatch(project) else \
-        re.sub(r"[^A-Za-z0-9]+", "-", spec).strip("-") or project
-    cache_dir = os.path.join(cache, "overleaf-fakegit", slug)
-    return cfg, cookie, cache_dir
+    return cfg, cookie, os.path.join(cache, "overleaf-fakegit", project)
 
 
 def _write_alternates(git_dir, mirror_objects):
@@ -151,88 +114,57 @@ def _mirror_tip(mirror):
     return str(repo.head.target)
 
 
-def _sync(cfg, cookie, cache_dir):
-    """Get the latest Overleaf state into the cache mirror, fast.
+class _InfoWriter:
+    """stdout replacement that relays complete lines live as progress."""
+    def __init__(self):
+        self.buf = ""
 
-    Strategy: a snapshot of the latest version is one zip download (never
-    rate-limited), so that's the reliable base. Change-list commits are only
-    replayed when there are few pending versions. All output is captured and
-    relayed as protocol-safe `info` lines (stdout is the git protocol)."""
-    import contextlib
-    import io
-    fakegit.create_mirror(cache_dir)
-    buf = io.StringIO()
-    result = "no changes"
-    _log("sync start")
-    try:
-        with contextlib.redirect_stdout(buf):
-            repo = fakegit.open_mirror(cache_dir)
-            state = fakegit.load_state(cache_dir)
-            tip = fakegit.mirror_tip_toV(repo)
-            # what we already have: the versioned tip, or the last version the
-            # snapshot was taken at (a snapshot tip itself has no version)
-            known = state.get("last_toV") or tip
-            _log("sync: tip=", tip, "known=", known)
-            snapshot_hash = None
-            new = []            # newest-first
-            try:
-                # single-page check: one cheap call, fail fast
-                page, _ = fakegit.fetch_updates(cfg, cookie, min_count=200)
-                new = [u for u in page if known is None or u["toV"] > known]
-                _log("sync: page=", len(page), "new=", len(new))
-            except fakegit.AuthError:
-                raise
-            except fakegit.FgError as e:
-                _log("sync: updates API failed: ", e)
-                print(f"change list unavailable ({e}); serving a snapshot.")
-                _, snapshot_hash = fakegit.snapshot_latest(cache_dir, cfg,
-                                                           cookie, None)
-                result = "snapshot"
-            if not result.startswith("snapshot"):
-                if len(new) > PROMPT_THRESHOLD:
-                    _log("sync: too many updates, snapshotting")
-                    print(f"{len(new)} versions pending "
-                          f"(≈{len(new)/30.0:.1f}h at the 30/hour limit) — "
-                          f"fetching the latest snapshot only.")
-                    _, snapshot_hash = fakegit.snapshot_latest(cache_dir, cfg,
-                                                               cookie, None)
-                    result = "snapshot"
-                elif new:
-                    _log("sync: replaying", len(new), "updates")
-                    print(f"downloading {len(new)} new version(s) from "
-                          f"overleaf…")
-                    try:
-                        fakegit.replay_history(cache_dir, cfg, cookie,
-                                               list(reversed(new)),
-                                               None, trickle=True)
-                        result = "synced"
-                    except fakegit.SyncError as e:
-                        if "throttl" in str(e):
-                            _log("sync: throttled, snapshot fallback: ", e)
-                            print(str(e))
-                            _, snapshot_hash = fakegit.snapshot_latest(
-                                cache_dir, cfg, cookie, None)
-                            result = "snapshot (rate-limited)"
-                        else:
-                            _log("sync: replay error: ", e)
-                            raise
-            state = fakegit.load_state(cache_dir)
-            if snapshot_hash is not None:
-                state["last_content_hash"] = snapshot_hash
-            # remember the newest known version so the next fetch skips the
-            # zip download when nothing changed
-            if new:
-                newest = new[0]["toV"]     # new is newest-first
-                state["last_toV"] = max(state.get("last_toV") or 0, newest)
-            fakegit.save_state(cache_dir, state)
-            _log("sync done: result=", result,
-                 "last_toV=", state.get("last_toV"))
-    finally:
-        for line in buf.getvalue().splitlines():
+    def write(self, text):
+        self.buf += text
+        while "\n" in self.buf:
+            line, self.buf = self.buf.split("\n", 1)
             if line.strip():
                 _info(line)
-    return result
+        return len(text)
 
+    def flush(self):
+        pass
+
+
+def _sync(cfg, cookie, cache_dir):
+    """Bring the cache mirror up to date: every new Overleaf version becomes a
+    commit (history API — not rate-limited; the first fetch replays the whole
+    history), labels become tags. Falls back to a snapshot of the latest
+    version if the change list is unavailable."""
+    import contextlib
+    fakegit.create_mirror(cache_dir)
+    _log("sync start")
+    with contextlib.redirect_stdout(_InfoWriter()):
+        repo = fakegit.open_mirror(cache_dir)
+        state = fakegit.load_state(cache_dir)
+        known = state.get("last_toV") or fakegit.mirror_tip_toV(repo)
+        try:
+            updates = fakegit.fetch_all_updates(cfg, cookie, after_toV=known)
+        except fakegit.AuthError:
+            raise
+        except fakegit.FgError as e:
+            _log("sync: updates API failed: ", e)
+            print(f"change list unavailable ({e}); serving a snapshot.")
+            _, h = fakegit.snapshot_latest(cache_dir, cfg, cookie, None)
+            if h:
+                state["last_content_hash"] = h
+                fakegit.save_state(cache_dir, state)
+            return "snapshot"
+        if updates:
+            print(f"replaying {len(updates)} Overleaf version(s) as commits"
+                  + (" (full history, first fetch)…" if known is None else "…"))
+            fakegit.replay_history(cache_dir, cfg, cookie, updates)
+            state = fakegit.load_state(cache_dir)
+            state["last_toV"] = updates[-1]["toV"]
+            fakegit.save_state(cache_dir, state)
+        fakegit.sync_labels(cache_dir, cfg, cookie)
+    _log("sync done: last_toV=", fakegit.load_state(cache_dir).get("last_toV"))
+    return "synced" if updates else "no changes"
 
 
 def _import_objects(git_dir, mirror):
@@ -345,12 +277,23 @@ def main():
                 except Exception as e:      # noqa: BLE001
                     _info(f"sync failed: {e}")
                 synced = True
+            service = cmd.split()[1] if len(cmd.split()) > 1 else ""
+            env = _git_env()
+            if service == "git-receive-pack":
+                # push: receive-pack on the cache mirror; its pre-receive hook
+                # uploads the change to Overleaf before the ref moves
+                fakegit.save_config(cache_dir, cfg)
+                fakegit.install_push_hook(cache_dir)
+                env["OVERLEAF_COOKIE"] = cookie
+            elif service != "git-upload-pack":
+                print(f"error: unsupported service {service}", file=sys.stderr)
+                return 1
             print()                         # empty line = connection established
             sys.stdout.flush()
-            p = subprocess.Popen(["git", "upload-pack", mirror],
+            p = subprocess.Popen(["git", service[len("git-"):], mirror],
                                  stdin=sys.stdin.fileno(),
                                  stdout=sys.stdout.fileno(),
-                                 stderr=sys.stderr, env=_git_env())
+                                 stderr=sys.stderr, env=env)
             p.wait()
             _log("connect ended")
             return 0                        # helper exits after the connection

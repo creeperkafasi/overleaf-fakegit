@@ -32,6 +32,11 @@ Commands:
   serve   run a read-only git daemon on the mirror (git:// + file://)
   status  show config / mirror / last sync / history
 
+`git push origin main` uploads your commits to Overleaf: the mirror's
+pre-receive hook diffs the pushed tree against the Overleaf state and
+uploads / deletes files (fast-forward only; rejected if Overleaf changed
+since your last sync).
+
 Auth: your `overleaf.sid` session cookie — via --cookie, OVERLEAF_COOKIE,
 cookie.txt in the project dir, or cookie.txt next to this script. Accepts the
 full Cookie header, the URL-encoded sid, or the bare sid.
@@ -413,16 +418,41 @@ def signature_from_meta(meta):
     offset = time.localtime(ts).tm_gmtoff // 60
     return pygit2.Signature(name, email, time=ts, offset=offset)
 
+def _user_ident(u):
+    name = ((u.get("first_name") or "") + " " + (u.get("last_name") or "")).strip()
+    return f"{name or u.get('email') or 'Overleaf user'} <{u.get('email') or 'overleaf@localhost'}>"
+
 def commit_message(u):
-    labels = u.get("labels") or []
-    for l in labels:
-        if l.get("comment"):
-            return str(l["comment"])
-    paths = u.get("pathnames") or []
+    """Subject keeps the `Overleaf change vX→vY` form (MSG_RE relies on it);
+    file ops, labels and extra authors go in the body."""
+    paths = list(u.get("pathnames") or [])
+    body = []
+    for op in u.get("project_ops") or []:
+        if "add" in op:
+            body.append(f"added {op['add']['pathname']}")
+            paths.append(op["add"]["pathname"])
+        elif "remove" in op:
+            body.append(f"removed {op['remove']['pathname']}")
+            paths.append(op["remove"]["pathname"])
+        elif "rename" in op:
+            r = op["rename"]
+            body.append(f"renamed {r['pathname']} -> {r['newPathname']}")
+            paths.append(r["newPathname"])
+    paths = list(dict.fromkeys(paths))
     p = ", ".join(paths[:5])
     if len(paths) > 5:
         p += f" (+{len(paths) - 5} more)"
-    return f"Overleaf change v{u['fromV']}→v{u['toV']}: {p}"
+    for l in u.get("labels") or []:
+        if l.get("comment"):
+            body.append(f"Overleaf label: {l['comment']}")
+    trailers = [f"Co-authored-by: {_user_ident(x)}"
+                for x in ((u.get("meta") or {}).get("users") or [])[1:]]
+    msg = f"Overleaf change v{u['fromV']}→v{u['toV']}: {p}"
+    if body:
+        msg += "\n\n" + "\n".join(body)
+    if trailers:
+        msg += "\n\n" + "\n".join(trailers)
+    return msg
 
 def commit_with_sig(repo, tree, message, sig):
     """Commit a tree onto the mirror's main branch (root commit if unborn)."""
@@ -494,8 +524,261 @@ class _ReplayPacer:
             return data
         raise SyncError(f"giving up on v{version} after {attempts} attempts")
 
+# --------------------------------------------------------------------------- history API engine (no rate limit)
+#
+# Per-version content without the throttled version zips:
+#   text   GET /project/<id>/diff?pathname=P&from=V&to=V   -> [{"u": <full text>}]
+#   binary GET /project/<id>/blob/<hash>                    (hash = git blob sha1)
+# Binary hashes come from the raw change log (GET /project/<id>/changes?since=N:
+# one entry per version; file adds carry the blob hash). A version zip is
+# only a last resort.
+
+BLOB_MODE = pygit2.GIT_FILEMODE_BLOB
+
+class HistoryAPI:
+    def __init__(self, cfg, cookie):
+        self.cfg, self.cookie = cfg, cookie
+        self.P = f"/project/{cfg['project']}"
+        self._changes = None
+        self._zips = {}
+
+    def _json(self, path):
+        data = http_get(self.cfg, self.cookie, self.P + path, timeout=120)
+        try:
+            return json.loads(data)
+        except ValueError as e:
+            raise SyncError(f"history API: bad JSON from {path}: {e}")
+
+    def files_at(self, v):
+        """[(path, editable)] of the project at version v."""
+        return [(e["pathname"], e.get("editable", True))
+                for e in self._json(f"/filetree/diff?from={v}&to={v}")["diff"]
+                if e.get("operation") != "removed"]
+
+    def content(self, path, v):
+        """Bytes of `path` at version v (text via the diff API, binary via
+        its blob)."""
+        q = urllib.parse.quote(path, safe="")
+        d = self._json(f"/diff?pathname={q}&from={v}&to={v}")["diff"]
+        if isinstance(d, dict) and d.get("binary"):
+            return self.binary(path, v)
+        return "".join(s.get("u", "") + s.get("i", "") for s in d).encode("utf-8")
+
+    def _load_changes(self):
+        """Every file's blob hash per version, from the raw change log
+        (/changes: one entry per version; adds carry the blob hash)."""
+        events, cur, since = {}, {}, 0
+        while True:
+            page = self._json(f"/changes?since={since}&paginated=true")
+            changes = page["changes"] if isinstance(page, dict) else page
+            for i, c in enumerate(changes):
+                v = since + i + 1                  # change k turns v(k) into v(k+1)
+                for o in c.get("operations") or []:
+                    p = o.get("pathname")
+                    if "file" in o:
+                        cur[p] = o["file"].get("hash")
+                        events.setdefault(p, []).append((v, cur[p]))
+                    elif "newPathname" in o:
+                        hsh = cur.pop(p, None)
+                        events.setdefault(p, []).append((v, None))
+                        if o["newPathname"]:
+                            cur[o["newPathname"]] = hsh
+                            events.setdefault(o["newPathname"], []).append((v, hsh))
+            since += len(changes)
+            if not (isinstance(page, dict) and page.get("hasMore")) or not changes:
+                break
+        self._changes = events
+
+    def _hash_at(self, path, v):
+        if self._changes is None:
+            self._load_changes()
+        hsh = None
+        for ev, eh in self._changes.get(path, []):
+            if ev <= v:
+                hsh = eh
+        return hsh
+
+    def binary(self, path, v):
+        hsh = self._hash_at(path, v)
+        if hsh:
+            data = http_get(self.cfg, self.cookie, f"{self.P}/blob/{hsh}", timeout=300)
+            if pygit2.hash(data) == pygit2.Oid(hex=hsh):
+                return data
+        # last resort: the (rate-limited) version zip
+        if v not in self._zips:
+            self._zips = {v: download_version_zip(self.cfg, self.cookie, v)}
+        with zipfile.ZipFile(io.BytesIO(self._zips[v])) as zf:
+            try:
+                return zf.read(path)
+            except KeyError:
+                raise SyncError(f"{path} missing from the v{v} zip")
+
+def flat_tree(repo, tree, prefix=""):
+    """{path: (oid, mode)} of a git tree."""
+    out = {}
+    for e in tree:
+        p = prefix + e.name
+        if e.filemode == pygit2.GIT_FILEMODE_TREE:
+            out.update(flat_tree(repo, repo[e.id], p + "/"))
+        else:
+            out[p] = (e.id, e.filemode)
+    return out
+
+def tree_from_flat(repo, flat):
+    nested = {}
+    for path, entry in flat.items():
+        *dirs, name = path.split("/")
+        d = nested
+        for x in dirs:
+            d = d.setdefault(x, {})
+        d[name] = entry
+    def build(d):
+        b = repo.TreeBuilder()
+        for name in sorted(d):
+            v = d[name]
+            if isinstance(v, dict):
+                b.insert(name, build(v), pygit2.GIT_FILEMODE_TREE)
+            else:
+                b.insert(name, v[0], v[1])
+        return b.write()
+    return build(nested)
+
+def _update_fetches(u):
+    """Paths whose content at u['toV'] is needed to build this version."""
+    need = set(u.get("pathnames") or [])
+    for op in sorted(u.get("project_ops") or [], key=lambda o: o.get("atV", 0)):
+        if "add" in op:
+            need.add(op["add"]["pathname"])
+        elif "remove" in op:
+            need.discard(op["remove"]["pathname"])
+        elif "rename" in op:
+            r = op["rename"]
+            if r["pathname"] in need:
+                need.discard(r["pathname"])
+                need.add(r["newPathname"])
+    return need
+
+def replay_history_api(project_dir, cfg, cookie, updates, workers=4, log=print):
+    """Replay updates (oldest->newest, contiguous) into the mirror with the
+    history API: each commit = parent tree + that update's file ops + the
+    new content of the files it touched. Returns #new commits."""
+    import concurrent.futures as cf
+    repo = open_mirror(project_dir)
+    tip_toV = mirror_tip_toV(repo)
+    todo = [u for u in updates if tip_toV is None or u["toV"] > tip_toV]
+    if not todo:
+        return 0
+    api = HistoryAPI(cfg, cookie)
+    if repo.head_is_unborn:
+        flat = {}
+        base_v = todo[0]["fromV"]
+        if base_v > 0:              # partial history: root = state at base_v
+            files = [p for p, _ in api.files_at(base_v)]
+            with cf.ThreadPoolExecutor(workers) as ex:
+                for p, data in zip(files, ex.map(lambda p: api.content(p, base_v), files)):
+                    flat[p] = (repo.create_blob(data), BLOB_MODE)
+            sig = pygit2.Signature("overleaf-fakegit", "fakegit@localhost")
+            commit_with_sig(repo, tree_from_flat(repo, flat),
+                            f"Overleaf change v0→v{base_v}: (earlier history "
+                            f"squashed)", sig)
+            log(f"  base: state at v{base_v} ({len(flat)} files)")
+    else:
+        flat = flat_tree(repo, repo[repo.head.target].tree)
+
+    def fetch(u):
+        return {p: api.content(p, u["toV"]) for p in _update_fetches(u)}
+
+    n = 0
+    with cf.ThreadPoolExecutor(workers) as ex:
+        for i in range(0, len(todo), 32):               # bounded lookahead
+            batch = todo[i:i + 32]
+            for u, contents in zip(batch, ex.map(fetch, batch)):
+                for op in sorted(u.get("project_ops") or [], key=lambda o: o.get("atV", 0)):
+                    if "remove" in op:
+                        flat.pop(op["remove"]["pathname"], None)
+                    elif "rename" in op:
+                        r = op["rename"]
+                        if r["pathname"] in flat:
+                            flat[r["newPathname"]] = flat.pop(r["pathname"])
+                for p, data in contents.items():
+                    flat[p] = (repo.create_blob(data), BLOB_MODE)
+                tree = tree_from_flat(repo, flat)
+                commit_with_sig(repo, tree, commit_message(u),
+                                signature_from_meta(u.get("meta") or {}))
+                n += 1
+            log(f"  replayed {n}/{len(todo)} (v{batch[-1]['toV']})")
+    return n
+
+# --------------------------------------------------------------------------- labels <-> tags
+
+LABEL_TAG_PREFIX = "overleaf/"
+
+def label_tag_name(comment):
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", comment or "").strip("-.") or "label"
+    return LABEL_TAG_PREFIX + slug[:60]
+
+def sync_labels(project_dir, cfg, cookie, log=print):
+    """Mirror Overleaf labels (named versions) as annotated tags
+    overleaf/<comment> on the commit of that version. Returns #new tags."""
+    repo = open_mirror(project_dir)
+    if repo.head_is_unborn:
+        return 0
+    try:
+        labels = json.loads(http_get(cfg, cookie, f"/project/{cfg['project']}/labels"))
+    except (SyncError, ValueError):
+        return 0
+    if not labels:
+        return 0
+    versions = []                               # (toV, commit), newest first
+    for c in repo.walk(repo.head.target, pygit2.GIT_SORT_TOPOLOGICAL):
+        m = MSG_RE.search(c.message or "")
+        if m:
+            versions.append((int(m.group(2)), c.id))
+    have = set()                                # subjects of existing tags
+    for ref in repo.references:
+        if ref.startswith("refs/tags/"):
+            obj = repo.revparse_single(ref)
+            if obj.type == pygit2.GIT_OBJECT_TAG:
+                have.add((obj.message or "").partition("\n")[0].strip())
+    n = 0
+    for l in labels:
+        name = label_tag_name(l.get("comment"))
+        if f"refs/tags/{name}" in repo.references or l.get("comment") in have:
+            continue
+        target = next((cid for v, cid in versions if v <= l.get("version", -1)), None)
+        if target is None:
+            continue                            # label predates the mirror
+        sig = signature_from_meta({"users": [l.get("user") or {}],
+                                   "end_ts": _iso_ms(l.get("created_at"))})
+        repo.create_tag(name, target, pygit2.GIT_OBJECT_COMMIT, sig,
+                        f"{l.get('comment')}\n\nOverleaf label at v{l.get('version')}\n")
+        log(f"  label -> tag {name}")
+        n += 1
+    return n
+
+def _iso_ms(iso):
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000
+    except (AttributeError, ValueError):
+        return None
+
 def replay_history(project_dir, cfg, cookie, updates, fetch_zip=None,
                    trickle=False):
+    if fetch_zip is None:
+        try:
+            return replay_history_api(project_dir, cfg, cookie, updates)
+        except SyncError as e:
+            msg = str(e)
+            if not ("HTTP 404" in msg and ("/diff" in msg or "/filetree" in msg)):
+                raise
+            print(f"history API unavailable ({e}) — using version zips "
+                  f"(rate-limited).")
+    return replay_history_zips(project_dir, cfg, cookie, updates, fetch_zip,
+                               trickle)
+
+def replay_history_zips(project_dir, cfg, cookie, updates, fetch_zip=None,
+                        trickle=False):
     """Replay a list of updates (oldest->newest) into the mirror, downloading a
     version zip per update (serial + adaptive pacing, polite to the server).
     Each version is committed as soon as its zip arrives, so an interrupted run
@@ -872,7 +1155,297 @@ class RealtimeListener:
         return resp
 
     def close(self):
+        if self.sid:
+            self._req(self._poll_url(), data=b"0::", timeout=10)   # disconnect
         self.sid = None
+
+    def join(self):
+        """Connect and return the joinProjectResponse project dict (the full
+        folder tree with doc/file/folder ids), then disconnect."""
+        try:
+            resp = self.connect()
+            for _ in range(3):
+                for pkt in split_socketio_payload(resp or ""):
+                    if not pkt.startswith("5:::"):
+                        continue
+                    try:
+                        obj = json.loads(pkt[4:])
+                    except ValueError:
+                        continue
+                    if obj.get("name") == "joinProjectResponse":
+                        return obj["args"][0]["project"]
+                resp = self.poll(timeout=30)
+        finally:
+            self.close()
+        raise SyncError("realtime: no joinProjectResponse (cannot read the "
+                        "project's file tree)")
+
+# --------------------------------------------------------------------------- write API (push)
+
+def fetch_csrf(cfg, cookie):
+    page = http_get(cfg, cookie, f"/project/{cfg['project']}").decode("utf-8", "replace")
+    m = re.search(r'<meta name="ol-csrfToken" content="([^"]+)"', page)
+    if not m:
+        raise SyncError("could not find the CSRF token on the editor page")
+    return html.unescape(m.group(1))
+
+def http_send(cfg, cookie, csrf, method, path, data=None, content_type=None,
+              timeout=120):
+    """Authenticated write request (CSRF-protected). Returns parsed JSON (or
+    {} for an empty/non-JSON body)."""
+    base = cfg["url"].rstrip("/")
+    headers = {"Cookie": cookie, "User-Agent": f"{APP_NAME}/1.0",
+               "X-Csrf-Token": csrf, "Origin": base, "Accept": "application/json",
+               "Referer": f"{base}/project/{cfg['project']}"}
+    if content_type:
+        headers["Content-Type"] = content_type
+    req = urllib.request.Request(base + path, data=data, headers=headers,
+                                 method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if urllib.parse.urlsplit(resp.geturl()).path.rstrip("/") == "/login":
+                raise AuthError(COOKIE_EXPIRED_MSG)
+            body = resp.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read()[:200].decode("utf-8", "replace").strip()
+        if e.code == 401:
+            raise AuthError(f"HTTP 401 — {COOKIE_EXPIRED_MSG}")
+        raise SyncError(f"{method} {path}: HTTP {e.code} {detail}")
+    except urllib.error.URLError as e:
+        raise SyncError(f"network error: {e.reason}")
+    try:
+        return json.loads(body) if body else {}
+    except ValueError:
+        return {}
+
+def _multipart(field, filename, data):
+    boundary = "----fakegit" + os.urandom(12).hex()
+    quoted = filename.replace("\\", "\\\\").replace('"', '\\"')
+    # newer Overleaf reads the name from a `name` field, older ones from the
+    # file part's filename — send both
+    head = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="name"\r\n\r\n'
+            f"{filename}\r\n"
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{field}"; filename="{quoted}"\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n").encode("utf-8")
+    return head + data + f"\r\n--{boundary}--\r\n".encode(), \
+        f"multipart/form-data; boundary={boundary}"
+
+def project_entities(project):
+    """Flatten a joinProjectResponse project into {path: (type, id)}; the root
+    folder is under ''. type is doc / file / folder."""
+    out = {}
+    def walk(folder, prefix):
+        for d in folder.get("docs") or []:
+            out[prefix + d["name"]] = ("doc", d["_id"])
+        for f in folder.get("fileRefs") or []:
+            out[prefix + f["name"]] = ("file", f["_id"])
+        for sub in folder.get("folders") or []:
+            p = prefix + sub["name"]
+            out[p] = ("folder", sub["_id"])
+            walk(sub, p + "/")
+    root = project["rootFolder"][0]
+    out[""] = ("folder", root["_id"])
+    walk(root, "")
+    return out
+
+def push_changes(cfg, cookie, new_paths, upserts, deletes, log=print,
+                 renames=()):
+    """Make the Overleaf project match a new tree: rename/move `renames`
+    ([(old, new)] — keeps the entity and its history), delete `deletes`
+    (paths), upload `upserts` ({path: bytes}, create or replace in place),
+    and drop folders left without any file in `new_paths`."""
+    ents = project_entities(RealtimeListener(cfg, cookie).join())
+    csrf = fetch_csrf(cfg, cookie)
+    pid = cfg["project"]
+
+    def under(path, folder):
+        return path.startswith(folder + "/")
+
+    def post_json(path, obj):
+        return http_send(cfg, cookie, csrf, "POST", path,
+                         json.dumps(obj).encode(), "application/json")
+
+    def folder_id(path):
+        if path in ents:
+            t, eid = ents[path]
+            if t != "folder":
+                raise SyncError(f"cannot create folder {path}/: a file has that name")
+            return eid
+        parent, _, name = path.rpartition("/")
+        r = http_send(cfg, cookie, csrf, "POST", f"/project/{pid}/folder",
+                      json.dumps({"name": name,
+                                  "parent_folder_id": folder_id(parent)}).encode(),
+                      "application/json")
+        if not r.get("_id"):
+            raise SyncError(f"creating folder {path}/ failed: {r}")
+        ents[path] = ("folder", r["_id"])
+        log(f"  created folder {path}/")
+        return r["_id"]
+
+    for old, new in renames:
+        if old not in ents:
+            raise SyncError(f"{old} is not on Overleaf any more — pull first")
+        t, eid = ents.pop(old)
+        (op, _, oname), (np_, _, nname) = old.rpartition("/"), new.rpartition("/")
+        if op != np_:
+            post_json(f"/project/{pid}/{t}/{eid}/move", {"folder_id": folder_id(np_)})
+        if oname != nname:
+            post_json(f"/project/{pid}/{t}/{eid}/rename", {"name": nname})
+        ents[new] = (t, eid)
+        log(f"  renamed {old} -> {new}")
+    renamed_away = [old for old, _ in renames]
+
+    # folders that held deleted/moved files and keep nothing: delete the topmost
+    dead = sorted(p for p, (t, _) in ents.items()
+                  if t == "folder" and p
+                  and any(under(d, p) for d in deletes + renamed_away)
+                  and not any(under(n, p) for n in new_paths))
+    dead = [p for p in dead if not any(under(p, q) for q in dead if q != p)]
+    for path in deletes:
+        if path in ents and not any(under(path, f) for f in dead):
+            t, eid = ents[path]
+            http_send(cfg, cookie, csrf, "DELETE", f"/project/{pid}/{t}/{eid}")
+            log(f"  deleted {path}")
+    for path in dead:
+        http_send(cfg, cookie, csrf, "DELETE",
+                  f"/project/{pid}/folder/{ents[path][1]}")
+        log(f"  deleted folder {path}/")
+
+    for path, data in upserts.items():
+        parent, _, name = path.rpartition("/")
+        body, ctype = _multipart("qqfile", name, data)
+        r = http_send(cfg, cookie, csrf, "POST",
+                      f"/Project/{pid}/upload?folder_id={folder_id(parent)}",
+                      body, ctype)
+        if not r.get("success"):
+            raise SyncError(f"uploading {path} failed: {r}")
+        log(f"  {'updated' if path in ents else 'added'} {path}")
+
+# --------------------------------------------------------------------------- push hook (receive-pack on the mirror)
+
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+ZERO_SHA = "0" * 40
+
+def install_push_hook(project_dir):
+    """Make the mirror accept pushes to main (fast-forward only); the
+    pre-receive hook uploads the change to Overleaf before the ref moves."""
+    mirror = mirror_path(project_dir)
+    hook = os.path.join(mirror, "hooks", "pre-receive")
+    os.makedirs(os.path.dirname(hook), exist_ok=True)
+    with open(hook, "w") as f:
+        f.write("#!/bin/sh\n"
+                f"exec '{sys.executable}' '{os.path.abspath(__file__)}' "
+                f"--dir '{os.path.abspath(project_dir)}' pre-receive\n")
+    os.chmod(hook, 0o755)
+    conf = pygit2.Repository(mirror).config    # not `git -C`: GIT_DIR may be set
+    conf["receive.denyNonFastForwards"] = True
+    conf["receive.denyDeletes"] = True
+
+def _hook_git(*args):
+    # inherits GIT_DIR + quarantine env from receive-pack, so pushed objects
+    # are visible before the ref is updated
+    p = subprocess.run(["git", *args], capture_output=True)
+    if p.returncode != 0:
+        raise GitError(f"git {' '.join(args)} failed: "
+                       f"{p.stderr.decode('utf-8', 'replace').strip()}")
+    return p.stdout
+
+def cmd_pre_receive(args):
+    project_dir = args.dir
+    cfg = load_config(project_dir)
+    lines = [l.split() for l in sys.stdin.read().splitlines() if l.strip()]
+    tags = [l for l in lines if l[2].startswith("refs/tags/")]
+    lines = [l for l in lines if l not in tags]
+    for old, new, ref in lines:
+        if ref != MAIN_REF:
+            raise FgError(f"only {MAIN_REF} and tags can be pushed (Overleaf "
+                          f"has no branches)")
+        if new == ZERO_SHA:
+            raise FgError("deleting main is not allowed")
+    for old, new, ref in tags:
+        if new == ZERO_SHA or old != ZERO_SHA:
+            raise FgError(f"{ref}: tags can only be created (Overleaf labels "
+                          f"can't be moved or deleted from git)")
+    cookie = resolve_cookie(project_dir, cfg)
+    state = load_state(project_dir)
+    for old, new, ref in lines:
+        # Overleaf must still be at the state the mirror holds, or we'd
+        # overwrite edits we haven't seen
+        newest, _ = fetch_updates(cfg, cookie, min_count=1)
+        newest_toV = newest[0]["toV"] if newest else None
+        known = state.get("last_toV")
+        if known is not None and newest_toV is not None and newest_toV != known:
+            raise FgError(f"Overleaf has changed since your last fetch "
+                          f"(v{known} → v{newest_toV}). Pull first, then push again.")
+        base = EMPTY_TREE if old == ZERO_SHA else old
+        # -M: git's rename detection -> Overleaf rename/move (keeps history)
+        diff = _hook_git("diff-tree", "-r", "-z", "-M", base, new).split(b"\0")
+        upserts, deletes, renames = {}, [], []
+        i = 0
+        while i < len(diff) - 1:
+            # ":<old mode> <new mode> <old sha> <new sha> <status>" \0 path [\0 new path]
+            _, mode, old_sha, sha, status = diff[i].decode().split()
+            path = diff[i + 1].decode("utf-8", "surrogateescape")
+            i += 2
+            if status.startswith("R"):
+                renames.append((path, diff[i].decode("utf-8", "surrogateescape")))
+                path = renames[-1][1]
+                i += 1
+                if sha == old_sha:
+                    continue
+            elif status == "D":
+                deletes.append(path)
+                continue
+            if mode in ("120000", "160000"):
+                raise FgError(f"{path}: symlinks/submodules can't be pushed to Overleaf")
+            upserts[path] = _hook_git("cat-file", "blob", sha)
+        if not upserts and not deletes and not renames:
+            print("overleaf: nothing to upload (same content).")
+            continue
+        new_paths = set(_hook_git("ls-tree", "-r", "-z", "--name-only", new)
+                        .decode("utf-8", "surrogateescape").split("\0")) - {""}
+        print(f"overleaf: uploading {len(upserts)} file(s), deleting "
+              f"{len(deletes)}, renaming {len(renames)}…", flush=True)
+        try:
+            push_changes(cfg, cookie, new_paths, upserts, deletes,
+                         log=lambda m: print(m, flush=True), renames=renames)
+        except FgError as e:
+            raise FgError(f"{e}\nOverleaf may be partially updated — pull, "
+                          f"then push again.")
+        # our own edits are new Overleaf versions: mark them as seen so the
+        # next fetch doesn't replay them back as duplicate commits
+        newest, _ = fetch_updates(cfg, cookie, min_count=1)
+        if newest:
+            state["last_toV"] = newest[0]["toV"]
+        state["last_push"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        save_state(project_dir, state)
+        print("overleaf: push applied.")
+    if tags:
+        # a tag labels the Overleaf state, so it must point at main's tip
+        # (as of this push)
+        main_tip = lines[-1][1] if lines else _hook_git(
+            "rev-parse", MAIN_REF).decode().strip()
+        newest, _ = fetch_updates(cfg, cookie, min_count=1)
+        csrf = fetch_csrf(cfg, cookie)
+        for _, new, ref in tags:
+            target = _hook_git("rev-parse", new + "^{commit}").decode().strip()
+            if target != main_tip:
+                raise FgError(f"{ref}: a tag must point at main's tip (the "
+                              f"current Overleaf state) to become a label")
+            name = ref[len("refs/tags/"):]
+            msg = ""                    # annotated tag: its subject line
+            if _hook_git("cat-file", "-t", new).decode().strip() == "tag":
+                body = _hook_git("cat-file", "tag", new).decode("utf-8", "replace")
+                msg = body.partition("\n\n")[2].strip().partition("\n")[0]
+            comment = msg or (name[len(LABEL_TAG_PREFIX):]
+                              if name.startswith(LABEL_TAG_PREFIX) else name)
+            http_send(cfg, cookie, csrf, "POST", f"/project/{cfg['project']}/labels",
+                      json.dumps({"comment": comment,
+                                  "version": newest[0]["toV"]}).encode(),
+                      "application/json")
+            print(f"overleaf: label '{comment}' created at v{newest[0]['toV']}")
 
 def _watch_realtime(project_dir, args, cfg):
     """Event-driven watch: keep a socket.io v1 connection to the project and
@@ -949,6 +1522,7 @@ def cmd_init(args):
     write_project_gitignore(project_dir)
 
     create_mirror(project_dir)
+    install_push_hook(project_dir)
     repo = open_mirror(project_dir)
 
     # --- replay history into the mirror
@@ -959,11 +1533,10 @@ def cmd_init(args):
         fetch_zip = lambda v: _version_zip_from_dir(args.updates_dir, v)
     else:
         try:
-            # default: no history replay — snapshot only (fast, one zip).
-            # Pass --max-updates N for the last N changes.
-            max_updates = args.max_updates if args.max_updates is not None else 0
+            # default: the whole history (history API, not rate-limited);
+            # --max-updates N for the last N changes, 0 for a snapshot only
             updates = fetch_all_updates(cfg, cookie, after_toV=None,
-                                        max_updates=max_updates)
+                                        max_updates=args.max_updates)
         except SyncError as e:
             if _is_updates_error(e):
                 print(f"change list unavailable ({e}) — seeding the mirror with "
@@ -974,10 +1547,11 @@ def cmd_init(args):
         fetch_zip = None
     if updates:
         print(f"replaying {len(updates)} Overleaf change(s) into the mirror "
-              f"(this downloads one zip per change; first run only)…")
+              f"(one commit each; first run only)…")
         n = replay_history(project_dir, cfg, cookie, updates, fetch_zip)
         print(f"mirror history: {n} commit(s) replayed "
               f"→ {str(repo.head.target)[:12]}")
+        sync_labels(project_dir, cfg, cookie)
     if repo.head_is_unborn:
         # no change list (or all filtered) but nothing in the mirror: seed it
         print("seeding mirror with a snapshot of the latest version.")
@@ -1063,6 +1637,8 @@ def do_sync(project_dir, args, cfg):
                 _, snapshot_hash = snapshot_latest(project_dir, cfg, cookie, args)
             else:
                 raise
+    if not getattr(args, "updates_dir", None):
+        sync_labels(project_dir, cfg, cookie)
     tip_after = mirror_tip_toV(repo)
     changed = tip_after is not None and tip_after != tip_before
     if backfill:
@@ -1112,6 +1688,7 @@ def cmd_sync(args):
     ensure_mirror(project_dir)
     ensure_git_repo(project_dir)
     cfg = load_config(project_dir)
+    install_push_hook(project_dir)      # mirrors created before push support
     with Lock(project_dir):
         do_sync(project_dir, args, cfg)
 
@@ -1301,6 +1878,75 @@ def cmd_projects(args):
         print(f"{p.get('id')}  {p.get('name')}  "
               f"({p.get('accessLevel')}, updated {str(p.get('lastUpdated'))[:10]})")
 
+def remote_cfg(spec, git_config):
+    """cfg + cookie for an `overleaf::<spec>` remote (spec: 24-hex id or a
+    unique name). git_config(key) -> value or None."""
+    tool_dir = os.path.dirname(os.path.abspath(__file__))
+    tool_cfg = {}
+    try:
+        with open(os.path.join(tool_dir, CONFIG_NAME)) as f:
+            tool_cfg = json.load(f)
+    except (OSError, ValueError):
+        pass
+    url = (git_config("overleaf.url") or os.environ.get("OVERLEAF_URL")
+           or tool_cfg.get("url") or "https://overleaf.ktu.edu.tr")
+    cfg = dict(DEFAULTS, url=url.rstrip("/"))
+    cookie = resolve_cookie(tool_dir, cfg, None, git_config("overleaf.cookie-file"))
+    project = spec.split("/")[-1] if spec else ""
+    if not PROJECT_ID_RE.fullmatch(project):
+        project = _resolve_project(cfg, cookie, project, interactive=False)
+    cfg["project"] = project
+    return cfg, cookie
+
+def project_context(project_dir):
+    """(cfg, cookie) for a project folder: its config.json (init workflow) or
+    an overleaf::<project> remote (clone workflow)."""
+    cfg = load_config(project_dir)
+    if cfg.get("project") and cfg.get("url"):
+        return cfg, resolve_cookie(project_dir, cfg)
+    remotes = git(project_dir, "remote", "-v", check=False).stdout.split()
+    spec = next((r[len("overleaf::"):] for r in remotes if r.startswith("overleaf::")), None)
+    if spec is None:
+        raise FgError("not an Overleaf project folder (no config.json and no "
+                      "overleaf::<project> remote).")
+    def gc(key):
+        out = git(project_dir, "config", "--get", key, check=False).stdout.strip()
+        return out or None
+    return remote_cfg(spec, gc)
+
+# --------------------------------------------------------------------------- chat
+
+def fetch_chat(cfg, cookie, limit=None):
+    """Project chat, oldest first (the API pages newest-first by timestamp)."""
+    out, before = [], None
+    while limit is None or len(out) < limit:
+        n = 100 if limit is None else min(100, limit - len(out))
+        q = f"/project/{cfg['project']}/messages?limit={n}"
+        if before:
+            q += f"&before={before}"
+        page = json.loads(http_get(cfg, cookie, q))
+        if not page:
+            break
+        out.extend(page)
+        before = page[-1]["timestamp"]
+        if len(page) < n:
+            break
+    return list(reversed(out))
+
+def cmd_chat(args):
+    cfg, cookie = project_context(args.dir)
+    msgs = fetch_chat(cfg, cookie, None if args.all else args.limit)
+    if args.json:
+        print(json.dumps(msgs, indent=2, ensure_ascii=False))
+        return
+    if not msgs:
+        print("(no chat messages)")
+    for m in msgs:
+        u = m.get("user") or {}
+        who = u.get("first_name") or u.get("email") or m.get("user_id")
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(m["timestamp"] / 1000))
+        print(f"[{ts}] {who} <{u.get('email', '?')}>: {m.get('content', '')}")
+
 def _cookie_available(project_dir, cfg):
     try:
         resolve_cookie(project_dir, cfg)
@@ -1313,8 +1959,8 @@ def _cookie_available(project_dir, cfg):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="fakegit.py",
-        description="Overleaf change list -> local git mirror + read-only server "
-                    "(fake git for Overleaf instances without git support).")
+        description="Overleaf history -> git (full history, push, labels as "
+                    "tags, chat) for Overleaf instances without a git bridge.")
     ap.add_argument("--dir", default=os.getcwd(),
                     help="project directory (default: current directory)")
     ap.add_argument("--verbose", action="store_true", help="more output")
@@ -1333,8 +1979,8 @@ def main(argv=None):
     p_init.add_argument("--cookie", help="session cookie value")
     p_init.add_argument("--cookie-file", help="path to a file with the cookie")
     p_init.add_argument("--max-updates", type=int, default=None,
-                        help="replay the last N history commits (default: none — "
-                             "snapshot only, fast)")
+                        help="replay only the last N Overleaf changes (default: "
+                             "the whole history; 0 = snapshot only)")
     p_init.add_argument("--updates-dir", help=argparse.SUPPRESS)
     p_init.add_argument("--from-zip", help=argparse.SUPPRESS)
 
@@ -1390,6 +2036,17 @@ def main(argv=None):
     p_status = sub.add_parser("status", help="show config, mirror, last sync, history")
     common(p_status)
 
+    p_chat = sub.add_parser("chat", help="show the project's chat messages")
+    common(p_chat)
+    p_chat.add_argument("-n", "--limit", type=int, default=50,
+                        help="last N messages (default 50)")
+    p_chat.add_argument("--all", action="store_true", help="the whole chat")
+    p_chat.add_argument("--json", action="store_true", help="raw JSON (oldest first)")
+
+    # run by the mirror's pre-receive hook on `git push` (not for direct use)
+    p_hook = sub.add_parser("pre-receive")
+    common(p_hook)
+
     args = ap.parse_args(argv)
     args.dir = os.path.abspath(args.dir)
     try:
@@ -1405,6 +2062,10 @@ def main(argv=None):
             cmd_projects(args)
         elif args.cmd == "status":
             cmd_status(args)
+        elif args.cmd == "chat":
+            cmd_chat(args)
+        elif args.cmd == "pre-receive":
+            cmd_pre_receive(args)
     except FgError as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)

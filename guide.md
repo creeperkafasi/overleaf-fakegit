@@ -1,7 +1,7 @@
 # overleaf-fakegit — User Guide
 
 A fake git remote for old Overleaf instances (like `overleaf.ktu.edu.tr`) that
-have no git bridge but allow zip downloads. This guide walks through every
+have no git bridge. This guide walks through every
 workflow. The README is the overview; this is the how-to.
 
 ---
@@ -13,7 +13,7 @@ workflow. The README is the overview; this is the how-to.
 | **Direct remote** | `git clone overleaf::<project>` | No setup beyond the tool folder. Every `git pull` checks Overleaf itself. |
 | **Mirror + server** | `init` + `watch` + `serve` | A local read-only git server (`git://` / `file://`) that friends can clone from. |
 
-Both share the same cache/mirror logic and the same rate-limit handling.
+Both share the same mirror logic, and both support `git push`.
 
 ---
 
@@ -54,17 +54,18 @@ vim main.tex && git add -A && git commit -m "..."
 git pull
 ```
 
-- First clone takes ~5–20 s: it downloads the **latest snapshot** (one zip,
-  never rate-limited) — not the whole history.
+- The first clone replays the **whole history**, one commit per Overleaf
+  change (about a second for a small project, ~7 min for ~1200 changes).
 - Each `git pull` makes one cheap change-list call; if nothing changed it's
-  "Already up to date" in ~1–5 s; if a few versions changed it downloads just
-  those and replays them as per-change commits.
+  "Already up to date" in ~1 s; otherwise it replays just the new changes.
 - Object transfer is a **native `git upload-pack`** (the `connect` capability):
   real pack negotiation, so only the *new* objects move, delta-compressed —
   not the whole project re-serialized.
-- Progress appears as `remote:` lines ("downloading 3 new version(s) from
-  overleaf…"). If many versions are pending it says so and serves the latest
-  snapshot instead (that's on purpose — see §7).
+- Progress appears as `remote:` lines ("replaying 3 Overleaf version(s) as
+  commits…").
+- Chat: `fakegit.py chat` inside the clone (see §6).
+
+- Push back: `git push` uploads your changes to Overleaf (see §4b).
 
 ---
 
@@ -98,6 +99,23 @@ python3 $HOME/dev/overleaf-fakegit/fakegit.py status         # what's going on
 
 ---
 
+## 4b. Pushing to Overleaf
+
+```sh
+git commit -am "..." && git push            # overleaf:: remote
+git push origin main                        # init/mirror workflow
+```
+
+- Changed/new files are uploaded in place (docs keep their Overleaf
+  history), new folders are created, deleted files/empty folders removed.
+- **Rejected (non-fast-forward / "Pull first")** → someone edited on Overleaf
+  since your last pull: `git pull`, resolve if needed, push again.
+- Only `main`, no force-push, no symlinks/submodules.
+- Uploads are limited to 200 files / 15 min per project by the server; a huge
+  first push may need to be split.
+
+---
+
 ## 5. The read-only server (for friends / other machines)
 
 ```sh
@@ -125,46 +143,24 @@ serving (read-only):
 
 ---
 
-## 6. History: when you actually want the per-change commits
+## 6. History, labels and chat
 
-By default nothing replays the full history (it's rate-limited, §7). Options:
+Each commit is one Overleaf change (grouped like Overleaf's History tab),
+with the real author, email and timestamp; the body lists added / removed /
+renamed files, labels, and `Co-authored-by:` when several people edited.
 
 ```sh
-# replay the last N changes at init:
-python3 .../fakegit.py init --dir . --max-updates 30
-
-# trickle the whole history in the background (~30 commits/hour):
-python3 .../fakegit.py watch --dir . --backfill
+git log --format='%h %ad %an: %s' --date=iso
+git log --follow -p -- sections/intro.tex     # one file, across renames
+git blame -w main.tex                         # who wrote each line
+git log -S'200 kbps' -p                       # when a phrase changed
+git tag -n                                    # Overleaf labels (overleaf/* tags)
+fakegit.py chat [--all] [--json]              # project chat
 ```
 
-Each commit is one Overleaf change, with the real author and timestamp:
-
-```
-hakanaydin <hakanaydin@ktu.edu.tr> 2026-08-16 Overleaf change v462→v463: bare_jrnl_new_sample4.tex
-```
-
-`--backfill` merges into your working repo only once the mirror catches up to
-the newest version (so the backfill never rewinds your tree).
-
----
-
-## 7. The rate limit (KTU instance) — why some things are slow
-
-Reverse-engineered from the ShareLaTeX source: the `/project/<id>/version/<v>/zip`
-endpoint allows **30 downloads per user per rolling hour**
-(`RateLimiterMiddleware.rateLimit({endpointName: 'download-project-revision',
-maxRequests: 30, timeInterval: 60*60})`), shared across all your projects and
-with the browser's History tab.
-
-Consequences, by design:
-- The **latest snapshot** (`/download/zip`) is *not* rate-limited → that's the
-  fast default everywhere.
-- Replaying history costs one version-zip per commit → at most 30/hour →
-  full backfills trickle over hours/days (`--backfill` handles it, resuming
-  from the mirror tip every time).
-- If a sync is throttled you'll see `throttled: version-download budget
-  exhausted (30/hour)…` and it falls back to a snapshot; the mirror resumes
-  from where it stopped next time.
+History comes from Overleaf's history API (`apis.md` §2b) — not
+rate-limited. Only the `/version/<v>/zip` endpoint is throttled (30/hour/user,
+shared with the browser's History tab); it's used only as a last resort.
 
 ---
 
@@ -173,7 +169,7 @@ Consequences, by design:
 | Symptom | Cause / fix |
 |---------|-------------|
 | `your cookie is expired or invalid (the server redirected to /login)` | Cookie expired. Copy a fresh one into `cookie.txt`. |
-| `throttled: version-download budget exhausted` | Used the 30/hour budget; retry in ~an hour, or let `watch`/`--backfill` resume automatically. |
+| `HTTP 429` / `throttled` | Only the version-zip fallback is throttled (30/hour); retry in ~an hour. |
 | `no changes on Overleaf since last sync` but you just edited | Overleaf may lag 1–2 min; run `sync --force` if you're sure. |
 | `git pull` says up to date but you want the latest state anyway | `git pull` triggers the check itself — if Overleaf genuinely has nothing new, it's up to date. |
 | `could not find the project list` | Old instance without the dashboard meta; pass `--project <24-hex-id>` instead of a name. |
@@ -185,19 +181,14 @@ Consequences, by design:
 
 ## 9. How it works (30-second version)
 
-1. `git-remote-overleaf` (or `sync`) asks the Overleaf change list which
-   versions are new: `GET /project/<id>/updates?min_count=…` (cheap JSON).
-2. New versions are downloaded as zips: `GET /project/<id>/version/<v>/zip`
-   (rate-limited, §7), extracted, and committed onto a local bare mirror
-   (`.overleaf/mirror.git`) with pygit2 — one commit per change, real
-   author/timestamp.
-3. The working repo fetches/merges that mirror like any git remote; or the
-   helper streams the objects to the requesting clone via fast-import.
+1. `git-remote-overleaf` (or `sync`) asks the change list which versions are
+   new: `GET /project/<id>/updates` (cheap JSON).
+2. Each new change is rebuilt from its parent: file ops from the change list,
+   text via `/diff?pathname=…&from=V&to=V`, binaries via `/blob/<hash>` (hash
+   from `/changes`), committed onto a bare mirror with pygit2. Labels become
+   `overleaf/*` tags.
+3. Your clone fetches that mirror through native `git upload-pack`; `git push`
+   goes through `git receive-pack`, whose pre-receive hook uploads the change
+   via Overleaf's write API before the ref moves.
 4. `watch --realtime` keeps a socket.io v1 xhr-polling connection (handshake
-   must include `?projectId=` — reverse-engineered from the instance) so edits
-   trigger sync within seconds.
-
-The old realtime channel can't serve *historical* content on this instance
-(no `loadDocVersions`; its history JSON is stale and non-invertible), so
-version zips remain the only per-version content source — hence the rate limit
-being the one real constraint.
+   must include `?projectId=`) so edits trigger sync within seconds.
